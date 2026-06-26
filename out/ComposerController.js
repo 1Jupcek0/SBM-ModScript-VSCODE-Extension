@@ -16,7 +16,31 @@ let composerFolder = process.env.localappdata + `\\Serena\\Studio\\Repository\\L
 let solutionsFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtSolution`;
 let javascriptFolder = composerFolder + `\\Serena.Studio.Framework.ObjectModel.JavascriptPart`;
 let sbmScriptFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtScript`;
-let sbmTableFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtTable`; //May end up using this to lookup database names and give intelesense based on this. 
+let sbmTableFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtTable`; //May end up using this to lookup database names and give intelesense based on this.
+let activeProvider = null;  // the live TreeDataProvider instance, so we can refresh it on repo change
+let watchers = [];          // current fs.watch handles, replaced when the repository changes
+// Switch the active repository at runtime (no extension-host restart needed).
+// Recomputes all folder paths, reloads solutions, refreshes the tree and re-arms the watchers.
+function setRepository(repo) {
+    selectedRepository = repo;
+    composerFolder = process.env.localappdata + `\\Serena\\Studio\\Repository\\Local\\` + selectedRepository;
+    solutionsFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtSolution`;
+    javascriptFolder = composerFolder + `\\Serena.Studio.Framework.ObjectModel.JavascriptPart`;
+    sbmScriptFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtScript`;
+    sbmTableFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtTable`;
+    if (!fs.existsSync(solutionsFolder)) {
+        throw new Error(`Repository folder not found: ${solutionsFolder}`);
+    }
+    solutions.length = 0;  // drop the previous repository's solutions before loading the new one
+    refreshSolutions();
+    if (activeProvider) {
+        activeProvider.data = [];      // clear cached tree items from the old repository
+        activeProvider.fullData = [];
+        activeProvider.setDataTree();
+        activeProvider.startWatchers();
+    }
+}
+exports.setRepository = setRepository;
 function nativeType(value) {
     var nValue = Number(value);
     if (!isNaN(nValue)) {
@@ -271,7 +295,16 @@ class TreeDataProvider {
             catch (error) {
             }
         }));
+        activeProvider = this;
         this.setDataTree();
+        this.startWatchers();
+    }
+    // (Re)establish file watchers on the current repository folders.
+    // Called on construction and whenever the active repository changes at runtime.
+    startWatchers() {
+        // Tear down any previous watchers so we don't keep watching the old repository
+        for (const w of watchers) { try { w.close(); } catch (e) { } }
+        watchers = [];
         var debouncedWatchFunction = debounce(_ => {
             this.setDataTree();
         }, 300, false);
@@ -279,15 +312,13 @@ class TreeDataProvider {
             refreshSolutions();
             this.setDataTree();
         }, 300, false);
-        fs.watch(sbmScriptFolder, { recursive: true }, (event, filename) => {
-            debouncedWatchFunction();
-        });
-        fs.watch(javascriptFolder, { recursive: true }, (event, filename) => {
-            debouncedWatchFunction();
-        });
-        fs.watch(solutionsFolder, { recursive: true }, (event, filename) => {
-            debouncedWatchFunctionSolutions();
-        });
+        try {
+            watchers.push(fs.watch(sbmScriptFolder, { recursive: true }, () => debouncedWatchFunction()));
+            watchers.push(fs.watch(javascriptFolder, { recursive: true }, () => debouncedWatchFunction()));
+            watchers.push(fs.watch(solutionsFolder, { recursive: true }, () => debouncedWatchFunctionSolutions()));
+        } catch (e) {
+            console.error('[ComposerController] startWatchers failed:', e);
+        }
     }
     refresh() {
         this._onDidChangeTreeData.fire(undefined);

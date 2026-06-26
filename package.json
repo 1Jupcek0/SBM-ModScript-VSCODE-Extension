@@ -93,46 +93,55 @@
 				"icon": "$(collapse-all)"
 			},
 			{
+				"command": "extension.openSettingsPanel",
+				"title": "Modscript: Open settings panel",
+				"icon": "$(settings)"
+			},
+			{
+				"command": "extension.openWelcome",
+				"title": "Modscript: Open Welcome"
+			},
+			{
 				"command": "extension.openComposerExplorer",
 				"title": "Open Composer Explorer"
 			},
 			{
 				"command": "extension.openClassBrowser",
-				"title": "Modscript: Otevřít Reference Browser",
+				"title": "Modscript: Open Reference Browser",
 				"icon": "$(library)"
 			},
 			{
 				"command": "extension.outlineGoTo",
-				"title": "Modscript: Přejít na symbol"
+				"title": "Modscript: Go to symbol"
 			},
 			{
 				"command": "extension.outlineFuncHide",
-				"title": "Skrýt funkce",
+				"title": "Hide functions",
 				"icon": "$(symbol-function)"
 			},
 			{
 				"command": "extension.outlineFuncShow",
-				"title": "Zobrazit funkce",
+				"title": "Show functions",
 				"icon": "$(eye-closed)"
 			},
 			{
 				"command": "extension.outlineClassHide",
-				"title": "Skrýt třídy",
+				"title": "Hide classes",
 				"icon": "$(symbol-class)"
 			},
 			{
 				"command": "extension.outlineClassShow",
-				"title": "Zobrazit třídy",
+				"title": "Show classes",
 				"icon": "$(eye-closed)"
 			},
 			{
 				"command": "extension.outlineMethodHide",
-				"title": "Skrýt metody",
+				"title": "Hide methods",
 				"icon": "$(symbol-method)"
 			},
 			{
 				"command": "extension.outlineMethodShow",
-				"title": "Zobrazit metody",
+				"title": "Show methods",
 				"icon": "$(eye-closed)"
 			}
 		],
@@ -170,6 +179,11 @@
 				},
 				{
 					"command": "extension.composerCollapseAll",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.openSettingsPanel",
 					"when": "view == composerExplorer",
 					"group": "navigation"
 				},
