@@ -1,0 +1,262 @@
+{
+	"name": "modscriptintellisense",
+	"displayName": "Modscript IntelliSense",
+	"version": "0.2.4",
+	"publisher": "jaysonmaw",
+	"engines": {
+		"vscode": "^1.32.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"languages": [
+			{
+				"id": "modscript",
+				"aliases": [
+					"Modscript",
+					"modscript"
+				],
+				"extensions": [
+					".tscm"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "modscript",
+				"scopeName": "source.tscm",
+				"path": "./syntaxes/modscript.tmLanguage.json"
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "composer-explorer",
+					"title": "Composer Explorer",
+					"icon": "media/Composer.svg"
+				}
+			]
+		},
+		"views": {
+			"explorer": [
+				{
+					"id": "modscriptOutline",
+					"name": "Modscript Outline"
+				}
+			],
+			"composer-explorer": [
+				{
+					"id": "composerExplorer",
+					"name": "Composer Explorer",
+					"icon": "media/Composer.svg",
+					"visibility": "visible"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "extension.searchComposerFiles",
+                "title": "Search Composer Files",
+				"icon": "$(search)"
+			},
+			{
+				"command": "extension.searchComposerFilesFuzzy",
+                "title": "Search Composer Files For Partial/Fuzzy Match",
+				"icon": "$(search-fuzzy)"
+			},
+			{
+				"command": "extension.composerSearchStop",
+				"title": "Show All Files (remove search filter)",
+				"icon": "$(search-stop)"
+			},
+			{
+				"command": "extension.composerRefreshRepository",
+				"title": "Refresh repository from cache by restarting Extension Host",
+				"icon": "$(extensions-refresh)"
+			},
+			{
+				"command": "extension.composerOpenSettings",
+				"title": "Refresh repository from cache by restarting Extension Host",
+				"icon": "$(settings-gear)"
+			},
+			{
+				"command": "extension.composerExpandAll",
+				"title": "Expand all solutions in the tree view",
+				"icon": "$(expand-all)"
+			},
+			{
+				"command": "extension.composerCollapseAll",
+				"title": "Collapse all solutions in the tree view",
+				"icon": "$(collapse-all)"
+			},
+            {
+                "command": "extension.openComposerExplorer",
+                "title": "Open Composer Explorer"
+            },
+			{
+				"command": "extension.outlineGoTo",
+				"title": "Modscript: Přejít na symbol"
+			},
+			{
+				"command": "extension.outlineFuncHide",
+				"title": "Skrýt funkce",
+				"icon": "$(symbol-function)"
+			},
+			{
+				"command": "extension.outlineFuncShow",
+				"title": "Zobrazit funkce",
+				"icon": "$(eye-closed)"
+			},
+			{
+				"command": "extension.outlineClassHide",
+				"title": "Skrýt třídy",
+				"icon": "$(symbol-class)"
+			},
+			{
+				"command": "extension.outlineClassShow",
+				"title": "Zobrazit třídy",
+				"icon": "$(eye-closed)"
+			},
+			{
+				"command": "extension.outlineMethodHide",
+				"title": "Skrýt metody",
+				"icon": "$(symbol-method)"
+			},
+			{
+				"command": "extension.outlineMethodShow",
+				"title": "Zobrazit metody",
+				"icon": "$(eye-closed)"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "extension.searchComposerFiles",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.searchComposerFilesFuzzy",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.composerSearchStop",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.composerRefreshRepository",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.composerOpenSettings",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.composerExpandAll",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.composerCollapseAll",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.outlineFuncHide",
+					"when": "view == modscriptOutline && modscript.outlineShowFunctions",
+					"group": "navigation@1"
+				},
+				{
+					"command": "extension.outlineFuncShow",
+					"when": "view == modscriptOutline && !modscript.outlineShowFunctions",
+					"group": "navigation@1"
+				},
+				{
+					"command": "extension.outlineClassHide",
+					"when": "view == modscriptOutline && modscript.outlineShowClasses",
+					"group": "navigation@2"
+				},
+				{
+					"command": "extension.outlineClassShow",
+					"when": "view == modscriptOutline && !modscript.outlineShowClasses",
+					"group": "navigation@2"
+				},
+				{
+					"command": "extension.outlineMethodHide",
+					"when": "view == modscriptOutline && modscript.outlineShowMethods",
+					"group": "navigation@3"
+				},
+				{
+					"command": "extension.outlineMethodShow",
+					"when": "view == modscriptOutline && !modscript.outlineShowMethods",
+					"group": "navigation@3"
+				}
+			]
+		},
+		"configuration": {
+			"title": "Modscript Settings",
+			"properties": {
+				"modscript.exportFolder": {
+					"type": [
+						"string",
+						"null"
+					],
+					"default": null,
+					"description": "Specifies the folder path you want to save exported composer scripts while using the Composer Explorer. No value defaults to the Documents/SBM Composer/Imports/."
+				},
+				"modscript.repositoryFolder": {
+					"type": [
+						"string",
+						"null"
+					],
+					"default": "1",
+					"description": "Local Cache Path > Project: Specifies the folder path of the repository, that will be used and shown in Composer Explorer. These folders are named with a number and are located in Local Cache Path (You can find it in SBM Composer Options > Connection > Local Cache Path), from there, select any folder. \nExample: Local Cache Path is C:\\Users\\<username>\\AppData\\Local\\Serena\\Studio\\Repository\\Local, there are folders: ...\\Local\\0, ...\\Local\\1 and ...\\Local\\2, find out which project you need to open and write corresponding number: \"1\"."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile && npm run -S esbuild-base -- --minify",
+		"compile": "tsc ./compileClasses.ts && node ./compileClasses.js && del compileClasses.js && tsc -p ./",
+		"lint": "eslint . --ext .ts,.tsx",
+		"watch": "tsc ./compileClasses.ts && node ./compileClasses.js && del compileClasses.js && tsc -watch -p ./",
+		"esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node",
+		"esbuild": "npm run -S esbuild-base -- --sourcemap",
+		"esbuild-watch": "npm run -S esbuild-base -- --sourcemap --watch",
+		"package": "vsce package --out packages"
+	},
+	"devDependencies": {
+		"@types/node": "^12.12.0",
+		"@types/vscode": "^1.32.0",
+		"@typescript-eslint/eslint-plugin": "^4.16.0",
+		"@typescript-eslint/parser": "^4.16.0",
+		"esbuild": "^0.12.8",
+		"eslint": "^7.21.0",
+		"typescript": "^4.2.2"
+	},
+	"dependencies": {
+		"xml-js": "^1.6.11"
+	},
+	"__metadata": {
+		"id": "26dda06a-9b8c-4ae8-8d91-f774a6d91748",
+		"publisherId": "f3ea43f5-1fc4-495c-b8fe-37c9d0333cf1",
+		"publisherDisplayName": "jaysonmaw",
+		"targetPlatform": "undefined",
+		"isApplicationScoped": false,
+		"isPreReleaseVersion": false,
+		"hasPreReleaseVersion": false,
+		"installedTimestamp": 1725893036144,
+		"pinned": false,
+		"preRelease": false,
+		"source": "gallery"
+	}
+}

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"require\\('./out/extension.js'\\)\")",
+      "Bash(node --check \"c:\\\\Users\\\\Jaroslav\\\\Desktop\\\\AktualniPrace\\\\VSCode_Modscript_Extension\\\\jaysonmaw.modscriptintellisense-0.2.4\\\\out\\\\extension.js\")",
+      "Bash(node -e \"JSON.parse\\(require\\('fs'\\).readFileSync\\('c:/Users/Jaroslav/Desktop/AktualniPrace/VSCode_Modscript_Extension/jaysonmaw.modscriptintellisense-0.2.4/package.json','utf8'\\)\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(ls \"C:\\\\Users\\\\Jaroslav\\\\.vscode\\\\extensions\\\\\" 2>/dev/null | grep -i modscript || echo \"NOT FOUND in .vscode/extensions\")",
+      "Read(//c/Users/Jaroslav/.vscode/extensions\" 2>/dev/**)",
+      "Read(//c/Users/Jaroslav/.vscode/extensions/jaysonmaw.modscriptintellisense-0.2.4/**)"
+    ]
+  }
+}
