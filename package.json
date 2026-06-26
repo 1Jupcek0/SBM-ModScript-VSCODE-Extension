@@ -9,8 +9,7 @@
 	"categories": [
 		"Other"
 	],
-	"activationEvents": [
-	],
+	"activationEvents": [],
 	"main": "./out/extension.js",
 	"contributes": {
 		"languages": [
@@ -43,30 +42,29 @@
 			]
 		},
 		"views": {
-			"explorer": [
-				{
-					"id": "modscriptOutline",
-					"name": "Modscript Outline"
-				}
-			],
 			"composer-explorer": [
 				{
 					"id": "composerExplorer",
 					"name": "Composer Explorer",
 					"icon": "media/Composer.svg",
 					"visibility": "visible"
+				},
+				{
+					"id": "modscriptOutline",
+					"name": "Modscript Outline",
+					"icon": "media/Composer2.svg"
 				}
 			]
 		},
 		"commands": [
 			{
 				"command": "extension.searchComposerFiles",
-                "title": "Search Composer Files",
+				"title": "Search Composer Files",
 				"icon": "$(search)"
 			},
 			{
 				"command": "extension.searchComposerFilesFuzzy",
-                "title": "Search Composer Files For Partial/Fuzzy Match",
+				"title": "Search Composer Files For Partial/Fuzzy Match",
 				"icon": "$(search-fuzzy)"
 			},
 			{
@@ -94,10 +92,15 @@
 				"title": "Collapse all solutions in the tree view",
 				"icon": "$(collapse-all)"
 			},
-            {
-                "command": "extension.openComposerExplorer",
-                "title": "Open Composer Explorer"
-            },
+			{
+				"command": "extension.openComposerExplorer",
+				"title": "Open Composer Explorer"
+			},
+			{
+				"command": "extension.openClassBrowser",
+				"title": "Modscript: Otevřít Reference Browser",
+				"icon": "$(library)"
+			},
 			{
 				"command": "extension.outlineGoTo",
 				"title": "Modscript: Přejít na symbol"
@@ -199,6 +202,11 @@
 					"command": "extension.outlineMethodShow",
 					"when": "view == modscriptOutline && !modscript.outlineShowMethods",
 					"group": "navigation@3"
+				},
+				{
+					"command": "extension.openClassBrowser",
+					"when": "view == modscriptOutline",
+					"group": "navigation@4"
 				}
 			]
 		},
@@ -257,6 +265,7 @@
 		"installedTimestamp": 1725893036144,
 		"pinned": false,
 		"preRelease": false,
-		"source": "gallery"
+		"source": "gallery",
+		"size": 30524689
 	}
 }

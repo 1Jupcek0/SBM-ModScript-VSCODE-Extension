@@ -28,6 +28,7 @@ let globalFuncs = {};
 let globalClasses = {};
 let diagnosticCollection;
 let outlineProvider;
+let classBrowserPanel = null;
 const Ranges_1 = require("./Ranges");
 let languageKeywords = ["var", "global", "def", "try", "catch", "finally", "if", "else", "while", "for", "case", "default", "switch", "return", "break", "continue", "this"];
 /**
@@ -843,48 +844,75 @@ function activate(context) {
 
     // Document Symbols provider — enables Ctrl+Shift+O outline and breadcrumbs
     const providerDocSymbols = vscode.languages.registerDocumentSymbolProvider('modscript', {
-        provideDocumentSymbols(document, token) {
+        async provideDocumentSymbols(document, token) {
+            // If this document hasn't been parsed yet, parse it now
+            if (!globalFuncs[document.uri.toString()]) {
+                await ParseDocument(document);
+            }
             const funcs = globalFuncs[document.uri.toString()] || [];
             const clses = globalClasses[document.uri.toString()] || [];
             const symbols = [];
 
+            function nameSelRange(declRange, name) {
+                if (!declRange) return null;
+                try {
+                    const lineText = document.lineAt(declRange.start.line).text;
+                    const idx = lineText.indexOf(name);
+                    if (idx >= 0) {
+                        return new vscode.Range(
+                            new vscode.Position(declRange.start.line, idx),
+                            new vscode.Position(declRange.start.line, idx + name.length)
+                        );
+                    }
+                } catch (e) {}
+                return declRange;
+            }
+
             for (const func of funcs) {
-                const range = func.declarationRange || func.range;
-                if (!range) continue;
-                const desc = (func.meathodDescription && func.meathodDescription !== 'User Defined Function')
-                    ? func.meathodDescription.trim().split('\n')[0]
-                    : '';
-                symbols.push(new vscode.DocumentSymbol(
-                    func.meathodName,
-                    desc,
-                    vscode.SymbolKind.Function,
-                    range,
-                    range
-                ));
+                try {
+                    const range = func.declarationRange || func.range;
+                    if (!range) continue;
+                    const sel = nameSelRange(func.declarationRange, func.meathodName) || range;
+                    const desc = (func.meathodDescription && func.meathodDescription !== 'User Defined Function')
+                        ? func.meathodDescription.trim().split('\n')[0]
+                        : '';
+                    symbols.push(new vscode.DocumentSymbol(
+                        func.meathodName,
+                        desc,
+                        vscode.SymbolKind.Function,
+                        range,
+                        sel
+                    ));
+                } catch (e) { /* skip malformed entry */ }
             }
 
             for (const c of clses) {
-                if (!c.range) continue;
-                const selRange = new vscode.Range(c.range.start, c.range.start);
-                const classSymbol = new vscode.DocumentSymbol(
-                    c.className,
-                    c.classDescription || '',
-                    vscode.SymbolKind.Class,
-                    c.range,
-                    selRange
-                );
-                for (const m of c.meathods) {
-                    const mRange = m.declarationRange || m.range;
-                    if (!mRange) continue;
-                    classSymbol.children.push(new vscode.DocumentSymbol(
-                        m.meathodName,
-                        '',
-                        vscode.SymbolKind.Method,
-                        mRange,
-                        mRange
-                    ));
-                }
-                symbols.push(classSymbol);
+                try {
+                    if (!c.range) continue;
+                    const selRange = new vscode.Range(c.range.start, c.range.start);
+                    const classSymbol = new vscode.DocumentSymbol(
+                        c.className,
+                        c.classDescription || '',
+                        vscode.SymbolKind.Class,
+                        c.range,
+                        selRange
+                    );
+                    for (const m of (c.meathods || [])) {
+                        try {
+                            const mRange = m.declarationRange || m.range;
+                            if (!mRange) continue;
+                            const mSel = nameSelRange(m.declarationRange, m.meathodName) || mRange;
+                            classSymbol.children.push(new vscode.DocumentSymbol(
+                                m.meathodName,
+                                '',
+                                vscode.SymbolKind.Method,
+                                mRange,
+                                mSel
+                            ));
+                        } catch (e) {}
+                    }
+                    symbols.push(classSymbol);
+                } catch (e) { /* skip */ }
             }
 
             return symbols;
@@ -932,18 +960,46 @@ function activate(context) {
     vscode.commands.executeCommand('setContext', 'modscript.outlineShowClasses', true);
     vscode.commands.executeCommand('setContext', 'modscript.outlineShowMethods', true);
 
-    // Navigation: jump to symbol when tree item is clicked
-    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineGoTo', (range) => {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || !range) return;
-        const pos = range instanceof vscode.Range ? range.start : range;
-        editor.selection = new vscode.Selection(pos, pos);
-        editor.revealRange(
-            range instanceof vscode.Range ? range : new vscode.Range(pos, pos),
-            vscode.TextEditorRevealType.InCenter
-        );
-        vscode.window.showTextDocument(editor.document);
+    // Navigation via selection — same pattern as webview onDidReceiveMessage.
+    // onDidChangeSelection gives us the real OutlineItem object (no JSON serialization),
+    // so item.data.declarationRange is a real vscode.Range with proper .start.line
+    context.subscriptions.push(outlineTreeView.onDidChangeSelection(async e => {
+        if (!e.selection || e.selection.length === 0) return;
+        const item = e.selection[0];
+        if (!item) return;
+        const data = item.data;
+        if (!data) return;  // placeholder item
+        // docUri = the file where this symbol is actually defined (may differ from active file via include())
+        const targetUri = item.docUri
+            || (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri.toString());
+        if (!targetUri) return;
+        let line = 0;
+        if (data.declarationRange) {
+            line = data.declarationRange.start.line;
+        } else if (data.range) {
+            line = data.range.start.line;
+        }
+        const pos = new vscode.Position(line, 0);
+        const vsRange = new vscode.Range(pos, pos);
+        try {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(targetUri));
+            // Open as a new permanent tab in the active group (preview:false prevents
+            // replacing the current script's tab; no split)
+            const editor = await vscode.window.showTextDocument(doc, {
+                viewColumn: vscode.ViewColumn.Active,
+                preserveFocus: false,
+                preview: false
+            });
+            editor.selection = new vscode.Selection(pos, pos);
+            editor.revealRange(vsRange, vscode.TextEditorRevealType.InCenter);
+        } catch (err) {
+            console.error('[outlineNav] failed for', targetUri, 'line', line, err);
+            vscode.window.showErrorMessage('Modscript: nepodařilo se otevřít definici: ' + err.message);
+        }
     }));
+
+    // Keep command registered (referenced in package.json menus) but navigation is handled above
+    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineGoTo', () => {}));
 
     // Toggle filters — icon switches between "symbol" and "eye-closed" via setContext
     context.subscriptions.push(vscode.commands.registerCommand('extension.outlineFuncHide', () => {
@@ -980,6 +1036,46 @@ function activate(context) {
     // Refresh outline when the active editor changes
     context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => {
         if (outlineProvider) outlineProvider.refresh();
+    }));
+
+    // ─── Class Reference Browser ──────────────────────────────────────────────
+    function sendBrowserData() {
+        if (!classBrowserPanel) return;
+        try {
+            const items = buildClassBrowserData();
+            classBrowserPanel.webview.postMessage({ cmd: 'setData', items });
+        } catch (e) {
+            console.error('[ModscriptBrowser] buildClassBrowserData failed:', e);
+        }
+    }
+
+    context.subscriptions.push(vscode.commands.registerCommand('extension.openClassBrowser', () => {
+        if (classBrowserPanel) {
+            classBrowserPanel.reveal(vscode.ViewColumn.Beside, false);
+            sendBrowserData();
+            return;
+        }
+        classBrowserPanel = vscode.window.createWebviewPanel(
+            'modscriptClassBrowser',
+            'Modscript Reference',
+            { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+        classBrowserPanel.webview.html = getClassBrowserHtml();
+        classBrowserPanel.webview.onDidReceiveMessage(async msg => {
+            if (msg.cmd === 'ready') {
+                sendBrowserData();
+            } else if (msg.cmd === 'navigate' && msg.uri && msg.line >= 0) {
+                try {
+                    const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(msg.uri));
+                    const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+                    const pos = new vscode.Position(msg.line, 0);
+                    editor.selection = new vscode.Selection(pos, pos);
+                    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+                } catch (e) {}
+            }
+        }, undefined, context.subscriptions);
+        classBrowserPanel.onDidDispose(() => { classBrowserPanel = null; }, null, context.subscriptions);
     }));
 
     let ExtensionMode;
@@ -1196,6 +1292,7 @@ function activate(context) {
                 }
                 if (ClassRange && newRange.start.isEqual(ClassRange.start)) {
                     tempClass.range = newRange;
+                    tempClass.sourceUri = document.uri.toString();  // file where this class is actually defined
                     newClasses.push(tempClass);
                     tempClass = null;
                     ClassRange = null;
@@ -1328,6 +1425,7 @@ function activate(context) {
                     meathod.range = new vscode.Range(document.lineAt(i).range.start, document.lineAt(i).range.start);
                 }
                 meathod.declarationRange = new vscode.Range(document.lineAt(i).range.start, document.lineAt(i).range.end);
+                meathod.sourceUri = document.uri.toString();  // file where this function is actually defined (survives include() merging)
                 if (ClassRange && tempClass.className != meathod.meathodName) {
                     tempClass.meathods.push(meathod);
                 }
@@ -1639,6 +1737,10 @@ function activate(context) {
 
         // Refresh the outline panel with newly parsed symbols
         if (outlineProvider) outlineProvider.refresh();
+        // Refresh the class browser if it's open (new user functions/classes may have been found)
+        if (classBrowserPanel) {
+            classBrowserPanel.webview.postMessage({ cmd: 'setData', items: buildClassBrowserData() });
+        }
     }
 }
 exports.activate = activate;
@@ -1797,12 +1899,222 @@ var debounce = function (func, wait, immediate) {
             func.apply(context, args);
     };
 };
+// ─── Class Browser helpers ───────────────────────────────────────────────────
+function getNonce() {
+    let n = '';
+    const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) n += c.charAt(Math.floor(Math.random() * c.length));
+    return n;
+}
+
+function buildClassBrowserData() {
+    const items = [];
+    const pmap = p => ({ name: p.name || '', type: Array.isArray(p.type) ? p.type.join('|') : (p.type || ''), desc: p.description || '', opt: !!p.optional });
+
+    for (const [, cls] of Object.entries(classes)) {
+        if (cls.className === '') {
+            for (const m of (cls.meathods || [])) {
+                items.push({ id: 'f_' + m.meathodName, name: m.meathodName, kind: 'function', src: 'sbm',
+                    desc: m.meathodDescription || '', params: (m.meathodParms || []).map(pmap),
+                    ret: m.meathodReturn || 'Void', retDesc: m.meathodReturnDescription || '' });
+            }
+        } else {
+            items.push({ id: 'c_' + cls.className, name: cls.className, kind: 'class', src: 'sbm',
+                desc: cls.classDescription || '', exposed: !!cls.exposed,
+                methods: (cls.meathods || []).map(m => ({ name: m.meathodName, desc: m.meathodDescription || '',
+                    params: (m.meathodParms || []).map(pmap), ret: m.meathodReturn || 'Void', retDesc: m.meathodReturnDescription || '' })),
+                props: (cls.properties || []).map(p => ({ name: p.propertyName || '', type: p.propertyType || '',
+                    desc: p.propertyDescription || '', ro: !!p.readOnly })) });
+        }
+    }
+
+    const seenF = new Set(), seenC = new Set();
+    for (const [uri, funcs] of Object.entries(globalFuncs)) {
+        for (const f of (funcs || [])) {
+            if (seenF.has(f.meathodName)) continue; seenF.add(f.meathodName);
+            items.push({ id: 'uf_' + f.meathodName, name: f.meathodName, kind: 'user-function', src: 'user',
+                uri, line: f.declarationRange ? f.declarationRange.start.line : -1,
+                desc: (f.meathodDescription && f.meathodDescription !== 'User Defined Function') ? f.meathodDescription : '',
+                params: (f.meathodParms || []).map(pmap), ret: f.meathodReturn || 'Void', retDesc: f.meathodReturnDescription || '' });
+        }
+    }
+    for (const [uri, clsList] of Object.entries(globalClasses)) {
+        for (const cls of (clsList || [])) {
+            if (seenC.has(cls.className)) continue; seenC.add(cls.className);
+            items.push({ id: 'uc_' + cls.className, name: cls.className, kind: 'user-class', src: 'user',
+                uri, line: cls.range ? cls.range.start.line : -1, desc: cls.classDescription || '',
+                methods: (cls.meathods || []).map(m => ({ name: m.meathodName, desc: m.meathodDescription || '',
+                    params: (m.meathodParms || []).map(pmap), ret: m.meathodReturn || 'Void',
+                    line: m.declarationRange ? m.declarationRange.start.line : -1 })),
+                props: (cls.properties || []).map(p => ({ name: p.propertyName || '', type: p.propertyType || '', desc: p.propertyDescription || '' })) });
+        }
+    }
+    return items;
+}
+
+function getClassBrowserHtml() {
+    const css = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.toolbar { padding: 8px; border-bottom: 1px solid var(--vscode-panel-border); flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
+#search { width: 100%; padding: 5px 9px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); border-radius: 3px; font-size: 13px; outline: none; }
+#search:focus { border-color: var(--vscode-focusBorder); }
+.filters { display: flex; gap: 5px; flex-wrap: wrap; }
+.pill { padding: 2px 10px; border-radius: 10px; font-size: 11px; cursor: pointer; border: 1px solid transparent; user-select: none; }
+.pill.on { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.pill.off { background: transparent; color: var(--vscode-descriptionForeground); border-color: var(--vscode-input-border, #555); }
+.split { display: flex; flex: 1; overflow: hidden; }
+.list-pane { width: 40%; min-width: 160px; overflow-y: auto; border-right: 1px solid var(--vscode-panel-border); }
+.row { padding: 5px 10px; cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.row:hover { background: var(--vscode-list-hoverBackground); }
+.row.sel { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+.ic { width: 16px; text-align: center; flex-shrink: 0; font-size: 13px; }
+.rname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rret { font-size: 10px; opacity: 0.6; flex-shrink: 0; max-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+.detail { flex: 1; overflow-y: auto; padding: 14px 16px; }
+.detail h2 { font-size: 15px; margin-bottom: 5px; }
+.badge { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; margin-bottom: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+.sig { font-family: monospace; font-size: 12px; background: var(--vscode-textCodeBlock-background, #252526); padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; word-break: break-all; white-space: pre-wrap; }
+.desc { opacity: 0.85; margin-bottom: 10px; line-height: 1.5; font-size: 12px; }
+.sec { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; opacity: .55; margin: 12px 0 4px; }
+.pr { padding: 3px 0; font-size: 12px; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.pname { font-weight: 600; }
+.ptype { font-family: monospace; color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+.popt { opacity: 0.5; font-size: 10px; }
+.mrow { padding: 5px 8px; cursor: pointer; border-radius: 3px; font-size: 12px; margin-bottom: 2px; }
+.mrow:hover { background: var(--vscode-list-hoverBackground); }
+.mrow code { font-family: monospace; }
+.navlink { color: var(--vscode-textLink-foreground); cursor: pointer; font-size: 11px; margin-bottom: 8px; display: inline-block; }
+.navlink:hover { text-decoration: underline; }
+.empty { padding: 20px; opacity: .5; text-align: center; font-size: 12px; }
+`;
+    const html = `
+<div class="toolbar">
+  <input id="search" type="text" placeholder="Hledat symbol, třídu, metodu...">
+  <div class="filters">
+    <span class="pill on" data-k="class">Třídy SBM</span>
+    <span class="pill on" data-k="function">Funkce SBM</span>
+    <span class="pill on" data-k="user-class">Vlastní třídy</span>
+    <span class="pill on" data-k="user-function">Vlastní funkce</span>
+  </div>
+</div>
+<div class="split">
+  <div class="list-pane" id="LP"><p class="empty">Načítání...</p></div>
+  <div class="detail" id="DP"><p class="empty">Vyberte položku ze seznamu.</p></div>
+</div>`;
+    const js = `
+(function() {
+var vsc = acquireVsCodeApi();
+var ALL = [], FIL = [], SEL = -1;
+var AK = { 'class': true, 'function': true, 'user-class': true, 'user-function': true };
+
+document.querySelectorAll('.pill').forEach(function(el) {
+  el.addEventListener('click', function() {
+    var k = el.dataset.k;
+    if (AK[k]) { AK[k] = false; el.className = 'pill off'; }
+    else { AK[k] = true; el.className = 'pill on'; }
+    render();
+  });
+});
+
+var ICONS = { 'class': '[C]', 'function': '[F]', 'user-class': '[U]', 'user-function': '[D]' };
+function ic(k) { return ICONS[k] || '[-]'; }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function buildSig(it) {
+  if (it.kind==='class'||it.kind==='user-class') return 'class ' + it.name + ' { ' + (it.methods||[]).length + ' metod, ' + (it.props||[]).length + ' vlastnosti }';
+  var p = (it.params||[]).map(function(p){ return (p.opt?'[':'')+p.name+': '+p.type+(p.opt?']':''); }).join(', ');
+  return (it.kind==='user-function'?'def ':'')+it.name+'('+p+'): '+(it.ret||'Void');
+}
+
+function render() {
+  var q = document.getElementById('search').value.toLowerCase();
+  FIL = ALL.filter(function(it) {
+    if (!AK[it.kind]) return false;
+    if (q && it.name.toLowerCase().indexOf(q) < 0 && (it.desc||'').toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  });
+  var LP = document.getElementById('LP');
+  if (FIL.length === 0) { LP.innerHTML = '<p class="empty">Žádné výsledky.</p>'; return; }
+  var h = '';
+  for (var i = 0; i < FIL.length; i++) {
+    var it = FIL[i], s = i === SEL ? ' sel' : '';
+    h += '<div class="row' + s + '" data-idx="' + i + '">' +
+         '<span class="ic">' + ic(it.kind) + '</span>' +
+         '<span class="rname">' + esc(it.name) + '</span>' +
+         (it.ret && it.ret !== 'Void' ? '<span class="rret">' + esc(it.ret) + '</span>' : '') +
+         '</div>';
+  }
+  LP.innerHTML = h;
+  if (SEL >= 0 && LP.children[SEL]) LP.children[SEL].scrollIntoView({block:'nearest'});
+}
+
+document.getElementById('LP').addEventListener('click', function(e) {
+  var row = e.target.closest('.row');
+  if (!row) return;
+  sel(parseInt(row.dataset.idx, 10));
+});
+
+document.getElementById('DP').addEventListener('click', function(e) {
+  var mrow = e.target.closest('.mrow[data-uri]');
+  if (mrow) vsc.postMessage({cmd:'navigate', uri:mrow.dataset.uri, line:parseInt(mrow.dataset.line,10)});
+  var navlink = e.target.closest('.navlink[data-uri]');
+  if (navlink) vsc.postMessage({cmd:'navigate', uri:navlink.dataset.uri, line:parseInt(navlink.dataset.line,10)});
+});
+
+function sel(i) {
+  SEL = i; render(); var it = FIL[i]; if (!it) return;
+  var h = '<h2>' + esc(it.name) + '</h2>';
+  h += '<span class="badge">' + (it.src==='sbm'?'SBM API':'Vlastní') + ' &middot; ' + esc(it.kind) + '</span>';
+  h += '<div class="sig">' + esc(buildSig(it)) + '</div>';
+  if (it.desc) h += '<div class="desc">' + esc(it.desc) + '</div>';
+  if (it.uri && it.line >= 0) h += '<a class="navlink" data-uri="' + esc(it.uri) + '" data-line="' + it.line + '">&rarr; Přejít na definici</a>';
+  if (it.params && it.params.length) {
+    h += '<div class="sec">Parametry</div>';
+    it.params.forEach(function(p) {
+      h += '<div class="pr"><span class="pname">' + esc(p.name) + '</span><span class="ptype">' + esc(p.type) + '</span>' + (p.opt ? '<span class="popt">volitelný</span>' : '') + (p.desc ? ' &mdash; ' + esc(p.desc) : '') + '</div>';
+    });
+  }
+  if (it.ret && it.ret !== 'Void') h += '<div class="sec">Vrací</div><div class="pr"><span class="ptype">' + esc(it.ret) + '</span>' + (it.retDesc ? ' &mdash; ' + esc(it.retDesc) : '') + '</div>';
+  if (it.methods && it.methods.length) {
+    h += '<div class="sec">Metody (' + it.methods.length + ')</div>';
+    it.methods.forEach(function(m) {
+      var mp = (m.params||[]).map(function(p){ return p.name+': '+p.type; }).join(', ');
+      var nav = (it.uri && m.line >= 0) ? ' data-uri="' + esc(it.uri) + '" data-line="' + m.line + '"' : '';
+      h += '<div class="mrow"' + nav + '><code><strong>' + esc(m.name) + '</strong>(' + esc(mp) + '): ' + esc(m.ret||'Void') + '</code>' + (m.desc ? '<br><span style="opacity:.6;font-size:11px">' + esc(m.desc) + '</span>' : '') + '</div>';
+    });
+  }
+  if (it.props && it.props.length) {
+    h += '<div class="sec">Vlastnosti (' + it.props.length + ')</div>';
+    it.props.forEach(function(p) {
+      h += '<div class="pr"><span class="pname">' + esc(p.name) + '</span><span class="ptype">' + esc(p.type) + '</span>' + (p.ro ? '<span class="popt">readonly</span>' : '') + (p.desc ? ' &mdash; ' + esc(p.desc) : '') + '</div>';
+    });
+  }
+  document.getElementById('DP').innerHTML = h;
+}
+
+document.getElementById('search').addEventListener('input', function() { SEL = -1; render(); });
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.cmd === 'setData') { ALL = e.data.items || []; SEL = -1; render(); }
+});
+vsc.postMessage({cmd:'ready'});
+})();
+`;
+    return '<!DOCTYPE html>\n<html lang="cs">\n<head>\n<meta charset="UTF-8">\n' +
+        '<title>Modscript Reference</title>\n' +
+        '<style>' + css + '</style>\n' +
+        '</head>\n<body>\n' + html + '\n' +
+        '<script>' + js + '</script>\n' +
+        '</body>\n</html>';
+}
+
 // ─── Modscript Outline: tree item ───────────────────────────────────────────
 class OutlineItem extends vscode.TreeItem {
-    constructor(label, collapsibleState, type, data) {
+    constructor(label, collapsibleState, type, data, docUri) {
         super(label, collapsibleState);
         this.type = type;  // 'function' | 'class' | 'method'
         this.data = data;
+        this.docUri = docUri || null;
     }
 }
 
@@ -1814,6 +2126,7 @@ class ModscriptOutlineProvider {
         this.showFunctions = true;
         this.showClasses = true;
         this.showMethods = true;
+        this.lastUri = null;  // keeps symbols visible after switching away from .tscm
     }
 
     refresh() {
@@ -1828,6 +2141,7 @@ class ModscriptOutlineProvider {
         if (element) {
             // Children of a class item → its methods
             if (element.type === 'class' && this.showMethods) {
+                const docUri = element.docUri;
                 return (element.data.meathods || []).map(meth => {
                     const params = (meth.meathodParms || []).map(p => {
                         const t = Array.isArray(p.type) ? p.type.join('|') : (p.type || 'Variant');
@@ -1837,33 +2151,32 @@ class ModscriptOutlineProvider {
                         `${meth.meathodName}(${params})`,
                         vscode.TreeItemCollapsibleState.None,
                         'method',
-                        meth
+                        meth,
+                        meth.sourceUri || docUri
                     );
                     item.iconPath = new vscode.ThemeIcon('symbol-method');
                     item.description = meth.meathodReturn || '';
                     item.tooltip = meth.meathodDescription || '';
-                    if (meth.declarationRange) {
-                        item.command = {
-                            command: 'extension.outlineGoTo',
-                            title: 'Přejít na',
-                            arguments: [meth.declarationRange]
-                        };
-                    }
                     return item;
                 });
             }
             return [];
         }
 
-        // Root level
+        // Root level — use lastUri as fallback so outline stays populated when editor loses focus
         const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document.languageId !== 'modscript') {
+        let uri;
+        if (editor && editor.document.languageId === 'modscript') {
+            uri = editor.document.uri.toString();
+            this.lastUri = uri;
+        } else if (this.lastUri) {
+            uri = this.lastUri;
+        } else {
             const placeholder = new vscode.TreeItem('Otevřete .tscm soubor');
             placeholder.iconPath = new vscode.ThemeIcon('info');
             return [placeholder];
         }
 
-        const uri = editor.document.uri.toString();
         const funcs = globalFuncs[uri] || [];
         const clses = globalClasses[uri] || [];
         const items = [];
@@ -1878,18 +2191,12 @@ class ModscriptOutlineProvider {
                     `${func.meathodName}(${params})`,
                     vscode.TreeItemCollapsibleState.None,
                     'function',
-                    func
+                    func,
+                    func.sourceUri || uri
                 );
                 item.iconPath = new vscode.ThemeIcon('symbol-function');
                 item.description = func.meathodReturn || '';
                 item.tooltip = func.meathodDescription ? func.meathodDescription.trim() : '';
-                if (func.declarationRange) {
-                    item.command = {
-                        command: 'extension.outlineGoTo',
-                        title: 'Přejít na',
-                        arguments: [func.declarationRange]
-                    };
-                }
                 items.push(item);
             }
         }
@@ -1901,18 +2208,12 @@ class ModscriptOutlineProvider {
                     cls.className,
                     hasMethods ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
                     'class',
-                    cls
+                    cls,
+                    cls.sourceUri || uri
                 );
                 item.iconPath = new vscode.ThemeIcon('symbol-class');
                 item.description = `${(cls.meathods || []).length} metod`;
                 item.tooltip = cls.classDescription || cls.className;
-                if (cls.range) {
-                    item.command = {
-                        command: 'extension.outlineGoTo',
-                        title: 'Přejít na',
-                        arguments: [cls.range]
-                    };
-                }
                 items.push(item);
             }
         }
