@@ -38,6 +38,24 @@ let languageKeywords = ["var", "global", "def", "try", "catch", "finally", "if",
  * 
  * @param {vscode.ExtensionContext} context - The context in which the extension is activated.
  */
+// Re-rank completion items by how often each label is actually used across the project's scripts.
+// Items with explicit priority sortText ('~' snippets, '0_' repo symbols) are left untouched.
+function applyUsageRanking(items) {
+    if (!items || !items.length) return items;
+    let usage;
+    try { usage = ComposerController_1.getScriptIndex().usage; } catch (e) { return items; }
+    if (!usage) return items;
+    for (const it of items) {
+        const label = typeof it.label === 'string' ? it.label : (it.label && it.label.label) || '';
+        if (!label) continue;
+        if (it.sortText && (it.sortText[0] === '~' || it.sortText.startsWith('0_'))) continue;
+        const f = usage[label.toLowerCase()] || 0;
+        const rank = String(Math.max(0, 100000 - f)).padStart(6, '0');
+        it.sortText = '1_' + rank + '_' + label;
+    }
+    return items;
+}
+
 function activate(context) {
     // Register the tree data provider and tree view
     treeDataProvider = new ComposerController_1.TreeDataProvider(context);
@@ -47,6 +65,44 @@ function activate(context) {
     });
 
     vscode.window.registerTreeDataProvider('composerExplorer', treeDataProvider);
+
+    // Show the active repository name next to the view title, e.g. "Composer Explorer - CDT-SBM-02"
+    function updateExplorerTitle() {
+        const repo = String(vscode.workspace.getConfiguration('modscript').get('repositoryFolder') || '');
+        let name = repo ? '#' + repo : '';
+        try {
+            const root = path.join(process.env.localappdata || '', 'Serena', 'Studio', 'Repository', 'Local');
+            const info = parseStripe(root)[repo];
+            if (info && info.server) name = info.server;
+        } catch (e) { /* fall back to folder number */ }
+        treeView.title = name ? 'Composer Explorer - ' + name : 'Composer Explorer';
+    }
+    updateExplorerTitle();
+
+    // Auto-expand the application the user is currently working in
+    // (the solution whose scripts were edited/checked out most recently)
+    function expandMainApplication() {
+        try {
+            const sols = treeDataProvider.data || [];
+            if (!sols.length) return;
+            let target = null;
+            let mainName = null;
+            try { mainName = ComposerController_1.getMainSolutionName(); } catch (e) { }
+            if (mainName) target = sols.find(s => s.label === mainName || (s.label && s.label.label === mainName));
+            if (!target) {
+                // fallback: most scripts
+                let bestCount = -1;
+                for (const s of sols) {
+                    const ch = s.children || [];
+                    const count = ((ch[0] && ch[0].children) || []).length + ((ch[1] && ch[1].children) || []).length;
+                    if (count > bestCount) { bestCount = count; target = s; }
+                }
+            }
+            if (target) treeView.reveal(target, { expand: 2, focus: false, select: false });
+        } catch (e) { console.error('[expandMainApplication]', e); }
+    }
+    setTimeout(expandMainApplication, 1500);
+
     // Register the file search bar
     context.subscriptions.push(vscode.commands.registerCommand("extension.searchComposerFiles", async () => {
         const query = await vscode.window.showInputBox({ placeHolder: 'Search files in Composer Explorer' });
@@ -172,6 +228,9 @@ function activate(context) {
                     if (newRepo !== prevRepo) {
                         try {
                             ComposerController_1.setRepository(newRepo);
+                            updateExplorerTitle();
+                            if (diagnosticCollection) diagnosticCollection.clear();  // drop the old repo's problems
+                            setTimeout(expandMainApplication, 1200);
                             vscode.window.showInformationMessage('Composer Explorer switched to repository ' + newRepo + '.');
                         } catch (re) {
                             vscode.window.showErrorMessage('Could not load repository ' + newRepo + ': ' + re.message);
@@ -216,6 +275,80 @@ function activate(context) {
         // slight delay so it opens after the workbench has settled
         setTimeout(openWelcome, 800);
     }
+
+    // ─── Checked-out / Favourites / Knowledge base views ──────────────────────
+    const checkedOutProvider = new CheckedOutProvider();
+    context.subscriptions.push(vscode.window.createTreeView('modscriptCheckedOut', { treeDataProvider: checkedOutProvider }));
+    if (ComposerController_1.onCheckoutChanged) {
+        context.subscriptions.push(ComposerController_1.onCheckoutChanged(() => checkedOutProvider.refresh()));
+    }
+
+    const favProvider = new FavouritesProvider(context);
+    context.subscriptions.push(vscode.window.createTreeView('modscriptFavourites', { treeDataProvider: favProvider }));
+
+    const kbProvider = new KnowledgeBaseProvider(context);
+    context.subscriptions.push(vscode.window.createTreeView('modscriptKnowledgeBase', { treeDataProvider: kbProvider }));
+
+    // Helper: derive a favourite payload from a clicked tree item (works for both the
+    // main Composer Explorer items and the Checked-out view items)
+    function favFromItem(item) {
+        if (!item) return null;
+        if (item.scriptInfo) return { id: item.scriptInfo.id, name: item.scriptInfo.name, solution: item.scriptInfo.solution, type: item.scriptInfo.type };
+        if (item.resourceScriptId) return { id: item.resourceScriptId, name: item.scriptName || item.label, solution: '', type: (item.resourceScriptId.indexOf('#script') >= 0 ? 'script' : 'javascript') };
+        // Main explorer TreeItem: id like "Solution/PartID#script", label like "Name - C"
+        if (item.id && typeof item.id === 'string' && item.id.indexOf('#') >= 0) {
+            const label = typeof item.label === 'string' ? item.label : (item.label && item.label.label) || '';
+            const name = label.replace(/\s*-\s*[CX]\s*$/, '').trim() || label;
+            const solution = item.id.split('/')[0];
+            return { id: item.id, name, solution, type: (item.id.indexOf('#script') >= 0 ? 'script' : 'javascript') };
+        }
+        return null;
+    }
+
+    context.subscriptions.push(vscode.commands.registerCommand('extension.addFavourite', async (item) => {
+        const fav = favFromItem(item);
+        if (!fav) { vscode.window.showWarningMessage('Select a script to add to favourites.'); return; }
+        await favProvider.addFavourite(fav);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.removeFavourite', async (item) => {
+        if (item && item.resourceScriptId) await favProvider.removeFavourite(item.resourceScriptId);
+    }));
+
+    // Knowledge base commands
+    context.subscriptions.push(vscode.commands.registerCommand('extension.kbAdd', async () => {
+        const name = await vscode.window.showInputBox({ prompt: 'Code Snippets: name for this snippet' });
+        if (!name) return;
+        const editor = vscode.window.activeTextEditor;
+        let body = '';
+        if (editor && !editor.selection.isEmpty) body = editor.document.getText(editor.selection);
+        if (!body) {
+            body = await vscode.window.showInputBox({ prompt: 'Snippet body (or select code in the editor first)' }) || '';
+        }
+        if (!body) return;
+        await kbProvider.addEntry(name, body);
+        vscode.window.showInformationMessage(`Saved "${name}" to Code Snippets.`);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.kbAddFromSelection', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.selection.isEmpty) { vscode.window.showWarningMessage('Select some code first.'); return; }
+        const name = await vscode.window.showInputBox({ prompt: 'Code Snippets: name for this snippet' });
+        if (!name) return;
+        await kbProvider.addEntry(name, editor.document.getText(editor.selection));
+        vscode.window.showInformationMessage(`Saved "${name}" to Code Snippets.`);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.kbDelete', async (item) => {
+        const name = item && item.kbName;
+        if (!name) return;
+        const ok = await vscode.window.showWarningMessage(`Delete "${name}" from Code Snippets?`, 'Delete', 'Cancel');
+        if (ok === 'Delete') await kbProvider.removeEntry(name);
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.kbInsert', async (entry) => {
+        const e = entry && entry.body ? entry : (entry && entry.kbBody ? { body: entry.kbBody } : null);
+        if (!e) return;
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { vscode.window.showWarningMessage('Open a file to insert into.'); return; }
+        await editor.insertSnippet(new vscode.SnippetString(e.body));
+    }));
     context.subscriptions.push(vscode.commands.registerCommand("extension.composerExpandAll", async () => {
         ComposerController_1.expandCollapseAllSolutions(treeView, treeDataProvider);
     }));
@@ -314,6 +447,47 @@ function activate(context) {
                     label: 'lambda',
                     detail: 'Lambda function',
                     snippet: 'fun (${1:param}) { $0 }'
+                },
+                // ── SBM API patterns ──
+                {
+                    label: 'getfield',
+                    detail: 'SBM: read a field value as string',
+                    snippet: '${1:record}.GetFieldValueString("${2:FieldName}")'
+                },
+                {
+                    label: 'getfieldint',
+                    detail: 'SBM: read a field value as int',
+                    snippet: '${1:record}.GetFieldValueInt("${2:FieldName}")'
+                },
+                {
+                    label: 'setfield',
+                    detail: 'SBM: set a field value',
+                    snippet: '${1:record}.SetFieldValue("${2:FieldName}", ${3:value});'
+                },
+                {
+                    label: 'loginfo',
+                    detail: 'SBM: write an info message to the log',
+                    snippet: 'Ext.LogInfoMsg("${1:message}");'
+                },
+                {
+                    label: 'logerror',
+                    detail: 'SBM: write an error message to the log',
+                    snippet: 'Ext.LogErrorMsg("${1:message}");'
+                },
+                {
+                    label: 'logwarn',
+                    detail: 'SBM: write a warning message to the log',
+                    snippet: 'Ext.LogWarningMsg("${1:message}");'
+                },
+                {
+                    label: 'seterror',
+                    detail: 'SBM: set the shell error message (aborts action)',
+                    snippet: 'Shell.SetLastErrorMessage("${1:message}");'
+                },
+                {
+                    label: 'recordadd',
+                    detail: 'SBM: add (commit) a record',
+                    snippet: '${1:record}.Add();'
                 }
             ];
             for (const s of codeSnippets) {
@@ -385,7 +559,7 @@ function activate(context) {
             }
             //@ts-ignore
             compitems = compitems.concat(Object.values(deduplicateVars).map(x => x.comp));
-            return compitems;
+            return applyUsageRanking(compitems);
         }
     });
     // Gives autocomplete on function that are meathods of a class or variable of a class.
@@ -535,7 +709,7 @@ function activate(context) {
                 return unique;
             }, []);
             //return compitems || undefined;
-            return result || undefined;
+            return applyUsageRanking(result) || undefined;
         }
     }, '.' // triggered whenever a '.' is being typed
     );
@@ -830,34 +1004,42 @@ function activate(context) {
                 }
             }
             variableTypesString = variableTypesString.slice(0, -1);
-            for (var meth of globalFuncs[document.uri.toString()]) {
-                if (meth.range.contains(position)) {
-                    let commitCharacterCompletion = new vscode.CompletionItem("JSDOC Documentation...", vscode.CompletionItemKind.Snippet);
-                    let tempString = "\n * ${1:" + meth.meathodName + " Description}\n";
-                    let index = 2;
-                    for (let param of meth.meathodParms) {
-                        if (param.type != "Variant") {
-                            tempString += " * @param {${" + index++ + "|" + param.type + "," + variableTypesString + "|}} ${" + index++ + ":" + param.name + " Paramater Description}\n";
-                        }
-                        else {
-                            tempString += " * @param {${" + index++ + "|" + variableTypesString + "|}} ${" + index++ + ":" + param.name + " Paramater Description}\n";
-                        }
-                    }
-                    if (meth.meathodReturn !== "Void") {
-                        tempString += " * @returns {${" + index++ + "|" + variableTypesString + "|}} ${" + index++ + ":Return Description}\n */";
-                    } else {
-                        tempString += "*/";
-                    }
-                    commitCharacterCompletion.insertText = new vscode.SnippetString(tempString);
-                    compitems.push(commitCharacterCompletion);
+            const uri = document.uri.toString();
+            // Find the function being documented and whether it is a class method
+            let meth = (globalFuncs[uri] || []).find(m => m.range && m.range.contains(position));
+            let isClassMethod = !!(meth && meth.ownerClass);
+            if (!meth) {
+                for (const c of (globalClasses[uri] || [])) {
+                    const mm = (c.meathods || []).find(m => m.range && m.range.contains(position));
+                    if (mm) { meth = mm; isClassMethod = true; break; }
                 }
             }
-            if (compitems.length == 0) {
-                let commitCharacterCompletion = new vscode.CompletionItem("JSDOC Documentation...", vscode.CompletionItemKind.Snippet);
-                //commitCharacterCompletion.documentation = new vscode.MarkdownString(cls.classDescription);
-                commitCharacterCompletion.insertText = new vscode.SnippetString("\n* ${1: Description}\n* @param {${2|" + variableTypesString + "|}} ${3:Paramater Description}\n* @returns {${4|" + variableTypesString + "|}} ${5:Return Description}\n*/");
-                compitems.push(commitCharacterCompletion);
+            if (!isClassMethod) {
+                for (const c of (globalClasses[uri] || [])) { if (c.range && c.range.contains(position)) { isClassMethod = true; break; } }
             }
+            const item = new vscode.CompletionItem("JSDOC Documentation...", vscode.CompletionItemKind.Snippet);
+            if (meth && isClassMethod) {
+                // Class methods: full @param / @returns scaffold
+                let tempString = "\n * ${1:" + meth.meathodName + " Description}\n";
+                let index = 2;
+                for (let param of (meth.meathodParms || [])) {
+                    if (param.type != "Variant") {
+                        tempString += " * @param {${" + index++ + "|" + param.type + "," + variableTypesString + "|}} ${" + index++ + ":" + param.name + " Paramater Description}\n";
+                    } else {
+                        tempString += " * @param {${" + index++ + "|" + variableTypesString + "|}} ${" + index++ + ":" + param.name + " Paramater Description}\n";
+                    }
+                }
+                if (meth.meathodReturn !== "Void") {
+                    tempString += " * @returns {${" + index++ + "|" + variableTypesString + "|}} ${" + index++ + ":Return Description}\n */";
+                } else {
+                    tempString += " */";
+                }
+                item.insertText = new vscode.SnippetString(tempString);
+            } else {
+                // Free functions (or anywhere else): description only, no params/returns
+                item.insertText = new vscode.SnippetString("\n * ${1:Description}\n */");
+            }
+            compitems.push(item);
             return compitems;
         }
     }, '*');
@@ -962,8 +1144,8 @@ function activate(context) {
     }
     context.subscriptions.push(provider1, provider2, providor3, providor4, provider6, provider7, provider8);
 
-    // Create diagnostic collection for error/warning markers
-    diagnosticCollection = vscode.languages.createDiagnosticCollection('modscript');
+    // Create diagnostic collection for error/warning markers (shown as "Composer problems")
+    diagnosticCollection = vscode.languages.createDiagnosticCollection('Composer problems');
     context.subscriptions.push(diagnosticCollection);
 
     // Document Symbols provider — enables Ctrl+Shift+O outline and breadcrumbs
@@ -1044,6 +1226,131 @@ function activate(context) {
     });
     context.subscriptions.push(providerDocSymbols);
 
+    // ─── References (Shift+F12) and Rename (F2) ───────────────────────────────
+    // Whole-word matches within the current document (skips comments and strings).
+    function wholeWordRanges(document, word) {
+        const ranges = [];
+        const re = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+        for (let i = 0; i < document.lineCount; i++) {
+            let text = document.lineAt(i).text.split('//')[0];
+            text = text.replace(/"[^"]*"/g, m => ' '.repeat(m.length)).replace(/'[^']*'/g, m => ' '.repeat(m.length));
+            let m;
+            while ((m = re.exec(text))) {
+                ranges.push(new vscode.Range(i, m.index, i, m.index + word.length));
+            }
+        }
+        return ranges;
+    }
+    const providerReferences = vscode.languages.registerReferenceProvider('modscript', {
+        provideReferences(document, position) {
+            const wr = document.getWordRangeAtPosition(position);
+            if (!wr) return [];
+            const word = document.getText(wr);
+            return wholeWordRanges(document, word).map(r => new vscode.Location(document.uri, r));
+        }
+    });
+    const providerRename = vscode.languages.registerRenameProvider('modscript', {
+        prepareRename(document, position) {
+            const wr = document.getWordRangeAtPosition(position);
+            if (!wr) throw new Error('You cannot rename this element.');
+            return wr;
+        },
+        provideRenameEdits(document, position, newName) {
+            const wr = document.getWordRangeAtPosition(position);
+            if (!wr) return;
+            const word = document.getText(wr);
+            const edit = new vscode.WorkspaceEdit();
+            for (const r of wholeWordRanges(document, word)) edit.replace(document.uri, r, newName);
+            return edit;
+        }
+    });
+    context.subscriptions.push(providerReferences, providerRename);
+
+    // ─── Auto-import / include helper ─────────────────────────────────────────
+    // If the symbol under the cursor is defined in another parsed script, offer to add include("...")
+    function scriptBaseName(uriStr) {
+        try {
+            let p = decodeURIComponent(uriStr).split(/[\\/]/).pop() || '';
+            return p.replace(/\.(tscm|js|vb)$/i, '');
+        } catch (e) { return ''; }
+    }
+    const providerInclude = vscode.languages.registerCodeActionsProvider('modscript', {
+        provideCodeActions(document, range, context, token) {
+            const actions = [];
+            const wr = document.getWordRangeAtPosition(range.start);
+            if (!wr) return actions;
+            const word = document.getText(wr);
+            const curBase = scriptBaseName(document.uri.toString());
+            let foundName = null;
+            // Primary: repo-wide index (knows every script, even un-opened ones)
+            try {
+                const idx = ComposerController_1.getScriptIndex();
+                const s = idx && idx.symbolToScript[word.toLowerCase()];
+                if (s && s !== curBase) foundName = s;
+            } catch (e) { }
+            // Fallback: already-parsed files
+            if (!foundName) {
+                const curUri = document.uri.toString();
+                for (const [uri, funcs] of Object.entries(globalFuncs)) {
+                    if (uri === curUri) continue;
+                    if ((funcs || []).some(f => f.meathodName === word)) { foundName = scriptBaseName(uri); break; }
+                }
+                if (!foundName) for (const [uri, clss] of Object.entries(globalClasses)) {
+                    if (uri === curUri) continue;
+                    if ((clss || []).some(c => c.className === word)) { foundName = scriptBaseName(uri); break; }
+                }
+            }
+            if (foundName) {
+                const full = document.getText();
+                const already = new RegExp('include\\(\\s*["\']' + foundName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '["\']').test(full);
+                if (!already) {
+                    const fix = new vscode.CodeAction(`Add include("${foundName}")`, vscode.CodeActionKind.QuickFix);
+                    fix.edit = new vscode.WorkspaceEdit();
+                    fix.edit.insert(document.uri, new vscode.Position(0, 0), `include("${foundName}");\n`);
+                    fix.isPreferred = true;
+                    actions.push(fix);
+                }
+            }
+            return actions;
+        }
+    }, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] });
+    context.subscriptions.push(providerInclude);
+
+    // ─── Completion from the repo-wide script index, ranked by real usage ─────
+    // Classes/functions that actually appear in the project's scripts are offered first
+    // (sorted by how often they're used), ahead of system API entries.
+    const providerRepoSymbols = vscode.languages.registerCompletionItemProvider('modscript', {
+        provideCompletionItems(document, position) {
+            let idx;
+            try { idx = ComposerController_1.getScriptIndex(); } catch (e) { return; }
+            if (!idx || !idx.symbols || !idx.symbols.length) return;
+            const curBase = scriptBaseName(document.uri.toString());
+            const full = document.getText();
+            // Which scripts are already included?
+            const includedNames = new Set();
+            let im; const incRe = /include\s*\(\s*["']([^"']+)["']/g;
+            while ((im = incRe.exec(full))) includedNames.add(im[1].toLowerCase());
+            const items = [];
+            for (const s of idx.symbols) {
+                const kind = s.kind === 'class' ? vscode.CompletionItemKind.Class : vscode.CompletionItemKind.Function;
+                const it = new vscode.CompletionItem(s.name, kind);
+                it.detail = `${s.kind} · ${s.script} · used ${s.freq}×`;
+                it.documentation = new vscode.MarkdownString(`Defined in **${s.script}** — used ${s.freq} time(s) across scripts.`);
+                const rank = String(Math.max(0, 100000 - s.freq)).padStart(6, '0');
+                it.sortText = '0_' + rank + '_' + s.name;
+                if (s.kind === 'function') it.commitCharacters = ['('];
+                // Auto-import: selecting a symbol from another script inserts its include() at the top
+                if (s.script && s.script !== curBase && !includedNames.has(s.script.toLowerCase())) {
+                    it.additionalTextEdits = [vscode.TextEdit.insert(new vscode.Position(0, 0), `include("${s.script}");\n`)];
+                    it.detail += ' · adds include';
+                }
+                items.push(it);
+            }
+            return items;
+        }
+    });
+    context.subscriptions.push(providerRepoSymbols);
+
     // ─── Modscript Outline panel ──────────────────────────────────────────────
     outlineProvider = new ModscriptOutlineProvider();
     const outlineTreeView = vscode.window.createTreeView('modscriptOutline', {
@@ -1056,6 +1363,8 @@ function activate(context) {
     vscode.commands.executeCommand('setContext', 'modscript.outlineShowFunctions', true);
     vscode.commands.executeCommand('setContext', 'modscript.outlineShowClasses', true);
     vscode.commands.executeCommand('setContext', 'modscript.outlineShowMethods', true);
+    vscode.commands.executeCommand('setContext', 'modscript.outlineShowGlobals', true);
+    vscode.commands.executeCommand('setContext', 'modscript.outlineShowInstances', true);
 
     // Navigation via selection — same pattern as webview onDidReceiveMessage.
     // onDidChangeSelection gives us the real OutlineItem object (no JSON serialization),
@@ -1128,6 +1437,26 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('extension.outlineMethodShow', () => {
         outlineProvider.showMethods = true;
         vscode.commands.executeCommand('setContext', 'modscript.outlineShowMethods', true);
+        outlineProvider.refresh();
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineGlobalHide', () => {
+        outlineProvider.showGlobals = false;
+        vscode.commands.executeCommand('setContext', 'modscript.outlineShowGlobals', false);
+        outlineProvider.refresh();
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineGlobalShow', () => {
+        outlineProvider.showGlobals = true;
+        vscode.commands.executeCommand('setContext', 'modscript.outlineShowGlobals', true);
+        outlineProvider.refresh();
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineInstanceHide', () => {
+        outlineProvider.showInstances = false;
+        vscode.commands.executeCommand('setContext', 'modscript.outlineShowInstances', false);
+        outlineProvider.refresh();
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('extension.outlineInstanceShow', () => {
+        outlineProvider.showInstances = true;
+        vscode.commands.executeCommand('setContext', 'modscript.outlineShowInstances', true);
         outlineProvider.refresh();
     }));
 
@@ -1793,6 +2122,94 @@ function activate(context) {
         globalFuncs[document.uri.toString()] = newMeathods;
         globalClasses[document.uri.toString()] = newClasses;
 
+        // ── Diagnostics: flag identifiers that aren't defined anywhere (real typos) ──
+        // "Known" = language keywords + SBM API + symbols parsed here + every identifier that
+        // appears anywhere in the repository (auto-covers lib.core symbols like VarType_Integer,
+        // ReadFlags, LCase that aren't in our compiled API) + local declarations in this buffer.
+        if (diagnosticCollection && vscode.workspace.getConfiguration('modscript').get('checkUndefinedVariables', true)) {
+            try {
+                const known = new Set();
+                const addName = n => { if (n) known.add(String(n).toLowerCase()); };
+                languageKeywords.forEach(addName);
+                ['true', 'false', 'null', 'this', 'fun', 'attr', 'global', 'in', 'is', 'new', 'void', 'me',
+                 'class', 'include', 'do', 'then', 'and', 'or', 'not', 'each', 'as'].forEach(addName);
+                for (const v of varList) addName(v.variable);
+                for (const f of newMeathods) addName(f.meathodName);
+                for (const c of newClasses) { addName(c.className); for (const m of (c.meathods || [])) addName(m.meathodName); for (const p of (c.properties || [])) addName(p.propertyName); }
+                for (const [, cls] of Object.entries(classes)) {
+                    if (cls.className) addName(cls.className);
+                    for (const m of (cls.meathods || [])) addName(m.meathodName);
+                    for (const p of (cls.properties || [])) addName(p.propertyName);
+                }
+                // Repo-wide identifiers (covers lib.core + anything used across scripts)
+                try {
+                    const idx = ComposerController_1.getScriptIndex();
+                    if (idx && idx.usage) for (const k of Object.keys(idx.usage)) known.add(k);
+                } catch (e) { }
+
+                // Build a comment-free, string-free mask of each line (handles /* */ across lines)
+                const masked = [];
+                let inBlock = false;
+                for (let li = 0; li < document.lineCount; li++) {
+                    const raw = document.lineAt(li).text;
+                    let out = '', j = 0;
+                    while (j < raw.length) {
+                        if (inBlock) {
+                            if (raw[j] === '*' && raw[j + 1] === '/') { inBlock = false; out += '  '; j += 2; }
+                            else { out += ' '; j++; }
+                        } else if (raw[j] === '/' && raw[j + 1] === '*') { inBlock = true; out += '  '; j += 2; }
+                        else if (raw[j] === '/' && raw[j + 1] === '/') { out += ' '.repeat(raw.length - j); break; }
+                        else { out += raw[j]; j++; }
+                    }
+                    out = out.replace(/"[^"]*"/g, m => ' '.repeat(m.length)).replace(/'[^']*'/g, m => ' '.repeat(m.length));
+                    masked.push(out);
+                }
+                // Collect local declarations from the buffer (handles := , for-items, catch params, typed params)
+                const fullMasked = masked.join('\n');
+                let dm;
+                const declRe = /\b(?:var|global|attr)\s+([A-Za-z_]\w*)/g;            // var x / global x / attr x
+                while ((dm = declRe.exec(fullMasked))) addName(dm[1]);
+                const assignRe = /([A-Za-z_]\w*)\s*:?=(?!=)/g;                        // x = ...  and  x := ...
+                while ((dm = assignRe.exec(fullMasked))) addName(dm[1]);
+                const forRe = /\bfor\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*:/g; // for (item : ...) / for (Type item : ...)
+                while ((dm = forRe.exec(fullMasked))) addName(dm[1]);
+                const catchRe = /\bcatch\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*\)/g; // catch(e) / catch(Type e)
+                while ((dm = catchRe.exec(fullMasked))) addName(dm[1]);
+                const paramRe = /\bdef\s+(?:[A-Za-z_]\w*::)?[A-Za-z_]\w*\s*\(([^)]*)\)/g; // def f(a, int b) params
+                while ((dm = paramRe.exec(fullMasked))) {
+                    for (let part of dm[1].split(',')) {
+                        const toks = part.trim().split(/\s+/);
+                        if (toks.length) addName(toks[toks.length - 1]);
+                    }
+                }
+
+                const diags = [];
+                const reIdent = /[A-Za-z_]\w*/g;
+                for (let li = 0; li < masked.length; li++) {
+                    const text = masked[li];
+                    if (/^\s*include\s*\(/.test(text)) continue;               // skip include() lines
+                    let m;
+                    while ((m = reIdent.exec(text))) {
+                        const word = m[0], start = m.index;
+                        if (/^\d/.test(word)) continue;
+                        const before = text.slice(0, start);
+                        const after = text.slice(start + word.length);
+                        if (/[.]\s*$/.test(before)) continue;                  // member access  x.word
+                        if (/^\s*\(/.test(after)) continue;                    // function call   word(
+                        if (/^\s*::/.test(after) || /::\s*$/.test(before)) continue; // Class::method
+                        if (/^\s*:?=(?!=)/.test(after)) continue;              // assignment target  word = / word :=
+                        if (/(?:\bdef|\bvar|\bglobal|\battr|\bclass|\bcase|\bcatch|\bfor)\s*[\(\s]$/.test(before)) continue; // declaration target
+                        if (known.has(word.toLowerCase())) continue;
+                        const range = new vscode.Range(li, start, li, start + word.length);
+                        diags.push(new vscode.Diagnostic(range, `'${word}' is not defined in this script or its includes.`, vscode.DiagnosticSeverity.Error));
+                    }
+                }
+                diagnosticCollection.set(document.uri, diags);
+            } catch (e) { console.error('[diagnostics]', e); }
+        } else if (diagnosticCollection) {
+            diagnosticCollection.set(document.uri, []);
+        }
+
         // Refresh the outline panel with newly parsed symbols
         if (outlineProvider) outlineProvider.refresh();
         // Refresh the class browser if it's open (new user functions/classes may have been found)
@@ -2360,6 +2777,11 @@ button.sec { background: var(--vscode-button-secondaryBackground, #3a3d41); colo
 kbd { font-family: monospace; background: var(--vscode-textCodeBlock-background, #252526); border: 1px solid var(--vscode-panel-border); border-radius: 3px; padding: 1px 6px; font-size: 11px; }
 .foot { text-align: center; margin-top: 30px; opacity: .5; font-size: 11.5px; }
 code { font-family: monospace; background: var(--vscode-textCodeBlock-background, #252526); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.feats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+.feats th { text-align: left; padding: 7px 10px; border-bottom: 2px solid var(--vscode-panel-border); opacity: .7; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.feats td { padding: 7px 10px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+.feats td:first-child { font-weight: 600; white-space: nowrap; }
+.feats code { font-size: 11px; }
 `;
     // Each card: optional screenshot (drop a PNG into media/<file> to replace the placeholder)
     function shot(file, caption) {
@@ -2422,6 +2844,32 @@ code { font-family: monospace; background: var(--vscode-textCodeBlock-background
   ${shot('welcome-snippets.png', 'Snippets and inline hints')}
 </div>
 
+<h2 style="margin-top:34px;border-top:1px solid var(--vscode-panel-border);padding-top:24px">📋 All features &amp; shortcuts</h2>
+<table class="feats">
+  <tr><th>Feature</th><th>How to use</th></tr>
+  <tr><td>Code completion (IntelliSense)</td><td>Type — keywords, snippets, classes, functions, variables; members after <code>.</code></td></tr>
+  <tr><td>Usage-ranked completion</td><td>Classes/functions found in your scripts are offered first, ranked by how often they're used</td></tr>
+  <tr><td>Signature help (parameter hints)</td><td>Inside a call, or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd></td></tr>
+  <tr><td>Hover info</td><td>Hover a symbol — shows its type/description</td></tr>
+  <tr><td>Go to Definition</td><td><kbd>F12</kbd> or <kbd>Ctrl</kbd>+Click</td></tr>
+  <tr><td>Find All References</td><td><kbd>Shift</kbd>+<kbd>F12</kbd></td></tr>
+  <tr><td>Rename Symbol</td><td><kbd>F2</kbd></td></tr>
+  <tr><td>Document Symbols / Outline jump</td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd></td></tr>
+  <tr><td>Auto-import</td><td>Selecting a class/function from another script auto-adds its <code>include()</code> (or <kbd>Ctrl</kbd>+<kbd>.</kbd>)</td></tr>
+  <tr><td>Diagnostics (Composer problems)</td><td>Flags identifiers not defined anywhere in the project as errors (toggle in settings)</td></tr>
+  <tr><td>JSDoc generator</td><td>Type <code>/**</code> above a function</td></tr>
+  <tr><td>General snippets</td><td><code>def</code> <code>defclass</code> <code>class</code> <code>forloop</code> <code>foridx</code> <code>whileloop</code> <code>ifel</code> <code>trycatch</code> <code>tryfinally</code> <code>switch</code> <code>lambda</code></td></tr>
+  <tr><td>SBM API snippets</td><td><code>getfield</code> <code>getfieldint</code> <code>setfield</code> <code>loginfo</code> <code>logerror</code> <code>logwarn</code> <code>seterror</code> <code>recordadd</code></td></tr>
+  <tr><td>Modscript Outline</td><td>Composer activity bar — grouped, colored symbols; toggles for functions/classes/methods/global variables/class instances; click to jump</td></tr>
+  <tr><td>Reference Browser</td><td>Outline toolbar 📚 button, or <b>Modscript: Open Reference Browser</b></td></tr>
+  <tr><td>Settings panel</td><td>Composer Explorer ⚙️ button, or <b>Modscript: Open settings panel</b></td></tr>
+  <tr><td>Repository name in title</td><td>Shown as “Composer Explorer - &lt;repo&gt;”</td></tr>
+  <tr><td>Checked Out view</td><td>Lists checked-out scripts; checking one out opens it automatically</td></tr>
+  <tr><td>Favourites</td><td>Right-click a script → <b>Add to Favourites</b> (☆ inline button)</td></tr>
+  <tr><td>Code Snippets</td><td>Named snippets — + to add, click to insert, or select code → right-click → Save to Code Snippets</td></tr>
+  <tr><td>Welcome page</td><td><b>Modscript: Open Welcome</b></td></tr>
+</table>
+
 <div class="foot">You can reopen this page any time: Command Palette → <b>Modscript: Open Welcome</b></div>`;
     const js = `
 (function() {
@@ -2457,6 +2905,8 @@ class ModscriptOutlineProvider {
         this.showFunctions = true;
         this.showClasses = true;
         this.showMethods = true;
+        this.showGlobals = true;          // global variables section
+        this.showInstances = true;        // global variables that hold a class instance
         this.lastUri = null;  // keeps symbols visible after switching away from .tscm
     }
 
@@ -2481,13 +2931,26 @@ class ModscriptOutlineProvider {
             func,
             func.sourceUri || fallbackUri
         );
-        item.iconPath = new vscode.ThemeIcon(kind === 'method' ? 'symbol-method' : 'symbol-function');
+        item.iconPath = kind === 'method'
+            ? new vscode.ThemeIcon('symbol-method', new vscode.ThemeColor('symbolIcon.methodForeground'))
+            : new vscode.ThemeIcon('symbol-function', new vscode.ThemeColor('symbolIcon.functionForeground'));
         item.description = func.meathodReturn || '';
         const desc = func.meathodDescription && func.meathodDescription !== 'User Defined Function'
             ? func.meathodDescription.trim() : '';
         item.tooltip = func.ownerClass
             ? `${func.ownerClass}.${func.meathodName}()${desc ? '\n' + desc : ''}`
             : desc;
+        return item;
+    }
+
+    // Build a leaf OutlineItem for a global variable
+    _makeGlobalItem(v, uri) {
+        const line = typeof v.declarationLine === 'number' ? v.declarationLine : (v.range ? v.range.start.line : 0);
+        const data = { declarationRange: new vscode.Range(line, 0, line, 0) };
+        const item = new OutlineItem(v.variable, vscode.TreeItemCollapsibleState.None, 'global', data, uri);
+        item.iconPath = new vscode.ThemeIcon('symbol-variable', new vscode.ThemeColor('symbolIcon.variableForeground'));
+        item.description = v.type || '';
+        item.tooltip = `global ${v.variable}${v.type ? ': ' + v.type : ''}`;
         return item;
     }
 
@@ -2498,11 +2961,20 @@ class ModscriptOutlineProvider {
                 return (element.data.funcs || []).map(f =>
                     this._makeFuncItem(f, element.data.uri, element.data.childKind));
             }
+            // Globals category → its variable leaves
+            if (element.type === 'gcat') {
+                return (element.data.vars || []).map(v => this._makeGlobalItem(v, element.data.uri));
+            }
             // Class node → its methods
             if (element.type === 'class' && this.showMethods) {
                 const docUri = element.docUri;
                 return (element.data.meathods || []).map(meth =>
                     this._makeFuncItem(meth, docUri, 'method'));
+            }
+            // Class-instance global → the methods you can call on it
+            if (element.type === 'instance') {
+                const cls = element.data.cls;
+                return (cls.meathods || []).map(meth => this._makeFuncItem(meth, element.docUri, 'method'));
             }
             return [];
         }
@@ -2542,7 +3014,7 @@ class ModscriptOutlineProvider {
                     'category',
                     { funcs: freeFuncs, uri, childKind: 'function' }
                 );
-                cat.iconPath = new vscode.ThemeIcon('symbol-namespace');
+                cat.iconPath = new vscode.ThemeIcon('symbol-namespace', new vscode.ThemeColor('symbolIcon.namespaceForeground'));
                 cat.description = `${freeFuncs.length}`;
                 cat.tooltip = 'Functions you can call directly';
                 roots.push(cat);
@@ -2556,7 +3028,7 @@ class ModscriptOutlineProvider {
                     'category',
                     { funcs: byOwner[owner], uri, childKind: 'method' }
                 );
-                cat.iconPath = new vscode.ThemeIcon('symbol-object');
+                cat.iconPath = new vscode.ThemeIcon('symbol-object', new vscode.ThemeColor('symbolIcon.objectForeground'));
                 cat.description = `.methods · ${byOwner[owner].length}`;
                 cat.tooltip = `Methods of "${owner}" — called as ${owner}.method()`;
                 roots.push(cat);
@@ -2573,14 +3045,201 @@ class ModscriptOutlineProvider {
                     cls,
                     cls.sourceUri || uri
                 );
-                item.iconPath = new vscode.ThemeIcon('symbol-class');
+                item.iconPath = new vscode.ThemeIcon('symbol-class', new vscode.ThemeColor('symbolIcon.classForeground'));
                 item.description = `${(cls.meathods || []).length} methods`;
                 item.tooltip = cls.classDescription || cls.className;
                 roots.push(item);
             }
         }
 
+        // Global variables — and, separately, globals that hold a class instance (with callable methods)
+        if (this.showGlobals || this.showInstances) {
+            const vars = globalVars[uri] || [];
+            const seen = new Set();
+            const plainGlobals = [];
+            const instances = [];
+            for (const v of vars) {
+                if (!v.variable || !v.GlobalScope) continue;
+                const key = v.variable.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                let cls = null;
+                if (v.type) {
+                    cls = clses.find(c => c.className === v.type) ||
+                          (classes[v.type] && classes[v.type].className ? classes[v.type] : null);
+                }
+                if (cls && (cls.meathods || []).length) instances.push({ v, cls });
+                else plainGlobals.push(v);
+            }
+
+            if (this.showGlobals && plainGlobals.length) {
+                const cat = new OutlineItem(
+                    'Global variables',
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'gcat',
+                    { vars: plainGlobals, uri }
+                );
+                cat.iconPath = new vscode.ThemeIcon('symbol-variable', new vscode.ThemeColor('symbolIcon.variableForeground'));
+                cat.description = `${plainGlobals.length}`;
+                cat.tooltip = 'Global variables in this script';
+                roots.push(cat);
+            }
+
+            if (this.showInstances) {
+                for (const { v, cls } of instances) {
+                    const line = typeof v.declarationLine === 'number' ? v.declarationLine : (v.range ? v.range.start.line : 0);
+                    const data = { declarationRange: new vscode.Range(line, 0, line, 0), cls };
+                    const item = new OutlineItem(
+                        v.variable,
+                        vscode.TreeItemCollapsibleState.Collapsed,
+                        'instance',
+                        data,
+                        uri
+                    );
+                    item.iconPath = new vscode.ThemeIcon('symbol-object', new vscode.ThemeColor('symbolIcon.variableForeground'));
+                    item.description = `${v.type} · ${(cls.meathods || []).length} methods`;
+                    item.tooltip = `${v.variable} = ${v.type}() — methods you can call on it`;
+                    roots.push(item);
+                }
+            }
+        }
+
         return roots;
+    }
+}
+
+// ─── Checked-out scripts view ────────────────────────────────────────────────
+class CheckedOutProvider {
+    constructor() {
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+    }
+    refresh() { this._onDidChangeTreeData.fire(); }
+    getTreeItem(e) { return e; }
+    getChildren(element) {
+        if (element) return [];
+        let list = [];
+        try { list = ComposerController_1.getCheckedOutScripts(); } catch (e) { }
+        if (!list.length) {
+            const ph = new vscode.TreeItem('No scripts checked out');
+            ph.iconPath = new vscode.ThemeIcon('info');
+            return [ph];
+        }
+        return list.map(s => {
+            const item = new vscode.TreeItem(s.name);
+            item.description = `${s.solution} · ${s.type === 'script' ? 'Script' : 'JS'}`;
+            item.tooltip = `${s.name} — checked out`;
+            item.iconPath = new vscode.ThemeIcon('verified-filled', new vscode.ThemeColor('gitDecoration.modifiedResourceForeground'));
+            item.contextValue = 'checkedOutScript';
+            item.resourceScriptId = s.id;
+            item.scriptName = s.name;
+            item.scriptInfo = s;
+            item.command = { command: 'composerExplorer.openFile', title: 'Open', arguments: [s.id] };
+            return item;
+        });
+    }
+}
+
+// ─── Favourites view ─────────────────────────────────────────────────────────
+class FavouritesProvider {
+    constructor(context) {
+        this.context = context;
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+    }
+    refresh() { this._onDidChangeTreeData.fire(); }
+    getTreeItem(e) { return e; }
+    getFavourites() { return this.context.globalState.get('modscript.favourites', []); }
+    async addFavourite(fav) {
+        if (!fav || !fav.id) return;
+        const favs = this.getFavourites();
+        if (favs.some(f => f.id === fav.id)) {
+            vscode.window.showInformationMessage(`"${fav.name}" is already in favourites.`);
+            return;
+        }
+        favs.push(fav);
+        await this.context.globalState.update('modscript.favourites', favs);
+        this.refresh();
+        vscode.window.showInformationMessage(`Added "${fav.name}" to favourites.`);
+    }
+    async removeFavourite(id) {
+        const favs = this.getFavourites().filter(f => f.id !== id);
+        await this.context.globalState.update('modscript.favourites', favs);
+        this.refresh();
+    }
+    getChildren(element) {
+        if (element) return [];
+        const favs = this.getFavourites();
+        if (!favs.length) {
+            const ph = new vscode.TreeItem('No favourites yet — right-click a script → Add to Favourites');
+            ph.iconPath = new vscode.ThemeIcon('star-empty');
+            return [ph];
+        }
+        return favs.map(f => {
+            const item = new vscode.TreeItem(f.name);
+            item.description = f.solution ? `${f.solution} · ${f.type === 'script' ? 'Script' : 'JS'}` : '';
+            item.tooltip = f.name;
+            item.iconPath = new vscode.ThemeIcon('star-full', new vscode.ThemeColor('charts.yellow'));
+            item.contextValue = 'favouriteScript';
+            item.resourceScriptId = f.id;
+            item.command = { command: 'composerExplorer.openFile', title: 'Open', arguments: [f.id] };
+            return item;
+        });
+    }
+}
+
+// ─── Knowledge base view (named code snippets) ───────────────────────────────
+const KB_SEED = [
+    { name: 'SelectSearch', body: 'def SelectSearch(table tableName, string searchField, string searchValue) {\n\tvar results = tableName.Search(searchField + " = \'" + searchValue + "\'");\n\treturn results;\n}' },
+    { name: 'template_class', body: 'class ${ClassName} {\n\tvar field;\n\n\tdef ${ClassName}() {\n\t\t// constructor\n\t}\n\n\tdef ${ClassName}::method(param) {\n\t\treturn param;\n\t}\n}' }
+];
+class KnowledgeBaseProvider {
+    constructor(context) {
+        this.context = context;
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+        // Seed defaults on first run
+        if (!context.globalState.get('modscript.kbSeeded')) {
+            context.globalState.update('modscript.kb', KB_SEED.slice());
+            context.globalState.update('modscript.kbSeeded', true);
+        }
+    }
+    refresh() { this._onDidChangeTreeData.fire(); }
+    getTreeItem(e) { return e; }
+    getEntries() { return this.context.globalState.get('modscript.kb', []); }
+    async addEntry(name, body) {
+        const entries = this.getEntries();
+        const existing = entries.findIndex(e => e.name === name);
+        if (existing >= 0) entries[existing] = { name, body };
+        else entries.push({ name, body });
+        await this.context.globalState.update('modscript.kb', entries);
+        this.refresh();
+    }
+    async removeEntry(name) {
+        const entries = this.getEntries().filter(e => e.name !== name);
+        await this.context.globalState.update('modscript.kb', entries);
+        this.refresh();
+    }
+    getChildren(element) {
+        if (element) return [];
+        const entries = this.getEntries();
+        if (!entries.length) {
+            const ph = new vscode.TreeItem('Empty — use the + button to add a snippet');
+            ph.iconPath = new vscode.ThemeIcon('add');
+            return [ph];
+        }
+        return entries.map(e => {
+            const item = new vscode.TreeItem(e.name);
+            const firstLine = (e.body || '').split('\n')[0];
+            item.description = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
+            item.tooltip = e.body;
+            item.iconPath = new vscode.ThemeIcon('symbol-snippet', new vscode.ThemeColor('charts.blue'));
+            item.contextValue = 'kbEntry';
+            item.kbName = e.name;
+            item.kbBody = e.body;
+            item.command = { command: 'extension.kbInsert', title: 'Insert', arguments: [e] };
+            return item;
+        });
     }
 }
 //# sourceMappingURL=extension.js.map

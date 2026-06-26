@@ -19,6 +19,156 @@ let sbmScriptFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.Object
 let sbmTableFolder = composerFolder + `\\Serena.Studio.PlugIns.TeamTrack.ObjectModel.TtTable`; //May end up using this to lookup database names and give intelesense based on this.
 let activeProvider = null;  // the live TreeDataProvider instance, so we can refresh it on repo change
 let watchers = [];          // current fs.watch handles, replaced when the repository changes
+// ── Checked-out script tracking (drives the "Checked out" view + auto-open on checkout) ──
+let checkedOutScripts = [];           // [{ id, name, solution, type }] currently checked out
+let knownCheckoutIds = new Set();     // ids seen as checked out on the previous scan (for transition detection)
+let checkoutInitialized = false;      // skip auto-open on the very first scan after load
+const checkoutEmitter = new vscode.EventEmitter();
+exports.onCheckoutChanged = checkoutEmitter.event;
+exports.getCheckedOutScripts = () => checkedOutScripts.slice();
+function openScriptById(id) {
+    if (activeProvider) {
+        try { activeProvider.openResource(id, true); } catch (e) { console.error('[openScriptById]', e); }
+    }
+}
+exports.openScriptById = openScriptById;
+
+// ── Table/field index (drives DB-field hovers) ──
+let fieldIndex = null;
+function _xtext(x) { return x && (x._text !== undefined ? x._text : (typeof x === 'string' ? x : '')) || ''; }
+function buildFieldIndex() {
+    const map = {};  // lowercased field name / db name -> [{ table, name, dbName, type, desc }]
+    try {
+        for (const d of fs.readdirSync(sbmTableFolder)) {
+            const p = `${sbmTableFolder}\\${d}`;
+            let nums;
+            try { nums = fs.readdirSync(p).filter(f => /^\d+$/.test(f)).map(Number); } catch (e) { continue; }
+            if (!nums.length) continue;
+            const h = Math.max(...nums);
+            let j;
+            try { j = JSON.parse(convert.xml2json(zlib.gunzipSync(fs.readFileSync(`${p}\\${h}`)).toString('utf8'), { compact: true })); }
+            catch (e) { continue; }
+            const t = j.TtTable;
+            if (!t || !t.Fields || !t.Fields.ModelObjectList) continue;
+            const tableName = _xtext(t.Name);
+            const mol = t.Fields.ModelObjectList;
+            for (const tk of Object.keys(mol)) {
+                if (!/Field$/.test(tk)) continue;
+                const type = tk.replace(/^Tt/, '').replace(/Field$/, '');
+                const arr = Array.isArray(mol[tk]) ? mol[tk] : [mol[tk]];
+                for (const f of arr) {
+                    const name = _xtext(f.Name), db = _xtext(f.DatabaseName), desc = _xtext(f.Description);
+                    const entry = { table: tableName, name, dbName: db, type, desc };
+                    for (const key of [name, db]) {
+                        if (key) { const k = key.toLowerCase(); (map[k] = map[k] || []).push(entry); }
+                    }
+                }
+            }
+        }
+    } catch (e) { console.error('[fieldIndex]', e); }
+    return map;
+}
+function getFieldIndex() { if (!fieldIndex) fieldIndex = buildFieldIndex(); return fieldIndex; }
+exports.getFieldIndex = getFieldIndex;
+
+// ── Repo-wide script symbol index ──
+// Scans every script's source to learn which classes/functions exist (and where they are
+// declared) and how often each is used, so completion can rank by real-world usage and the
+// include() quick-fix knows which script to import.
+let scriptIndex = null;
+function buildScriptIndex() {
+    const symbolToScript = {};  // lowercased symbol -> defining script base name (e.g. SOAR_CLASS_AuxCity)
+    const freq = {};            // lowercased declared symbol -> usage count across all scripts
+    const usage = {};           // lowercased ANY identifier -> total occurrences across all scripts
+    const symbols = {};         // lowercased symbol -> { name, kind, script }
+    const contents = [];        // { base, text } for the frequency pass
+    function readContent(folder, partID, isJs) {
+        try {
+            const f = readComposerFile(`${folder}\\${partID}`);
+            return isJs ? (f.JavascriptPart && f.JavascriptPart.Content) : (f.TtScript && f.TtScript.Content);
+        } catch (e) { return null; }
+    }
+    const classRe = /(?:^|[^\w.])class\s+([A-Za-z_]\w*)/g;
+    const defRe = /(?:^|[^\w.])def\s+(?:([A-Za-z_]\w*)::)?([A-Za-z_]\w*)\s*\(/g;
+    function declare(name, kind, base) {
+        if (!name) return;
+        const k = name.toLowerCase();
+        if (!symbols[k] || (kind === 'class' && symbols[k].kind !== 'class')) {
+            symbols[k] = { name, kind, script: base };
+            symbolToScript[k] = base;
+        }
+    }
+    try {
+        for (const sol of solutions) {
+            for (const sc of (sol.sbmscripts || [])) {
+                const text = readContent(sbmScriptFolder, sc.PartID, false);
+                if (!text) continue;
+                const base = sc.Name;
+                contents.push({ base, text });
+                let m;
+                classRe.lastIndex = 0; while ((m = classRe.exec(text))) declare(m[1], 'class', base);
+                defRe.lastIndex = 0; while ((m = defRe.exec(text))) { if (m[1]) declare(m[1], 'class', base); else declare(m[2], 'function', base); }
+            }
+            for (const js of (sol.javascripts || [])) {
+                const text = readContent(javascriptFolder, js.PartID, true);
+                if (!text) continue;
+                const base = js.Name;
+                contents.push({ base, text });
+                let m;
+                classRe.lastIndex = 0; while ((m = classRe.exec(text))) declare(m[1], 'class', base);
+                defRe.lastIndex = 0; while ((m = defRe.exec(text))) { if (m[1]) declare(m[1], 'class', base); else declare(m[2], 'function', base); }
+            }
+        }
+        // Frequency pass: count every identifier across all sources.
+        // - freq:  occurrences of declared class/function symbols (for the symbol-completion list)
+        // - usage: occurrences of ALL identifiers (drives usage-based ranking + "known" set for diagnostics,
+        //          which auto-covers lib.core symbols like VarType_Integer / ReadFlags that aren't in our API)
+        const tokRe = /[A-Za-z_]\w*/g;
+        for (const c of contents) {
+            let m;
+            while ((m = tokRe.exec(c.text))) {
+                const k = m[0].toLowerCase();
+                usage[k] = (usage[k] || 0) + 1;
+                if (symbols[k]) freq[k] = (freq[k] || 0) + 1;
+            }
+        }
+    } catch (e) { console.error('[scriptIndex]', e); }
+    return {
+        symbolToScript, freq, usage,
+        symbols: Object.values(symbols).map(s => ({ ...s, freq: freq[s.name.toLowerCase()] || 0 }))
+    };
+}
+function getScriptIndex() { if (!scriptIndex) scriptIndex = buildScriptIndex(); return scriptIndex; }
+function invalidateScriptIndex() { scriptIndex = null; }
+exports.getScriptIndex = getScriptIndex;
+exports.invalidateScriptIndex = invalidateScriptIndex;
+
+// Which application is the user currently working in? Heuristic: the solution whose scripts
+// were most recently modified (you check out / edit scripts in the app you're actively using).
+function getMainSolutionName() {
+    let best = null, bestT = -1;
+    function maxMtime(folder, arr) {
+        let t = 0;
+        for (const x of (arr || [])) {
+            try {
+                const p = `${folder}\\${x.PartID}`;
+                const nums = fs.readdirSync(p).filter(f => /^\d+$/.test(f)).map(Number);
+                if (!nums.length) continue;
+                const h = Math.max(...nums);
+                const f = fs.existsSync(`${p}\\${h}.#`) ? `${p}\\${h}.#` : `${p}\\${h}`;
+                const mt = fs.statSync(f).mtimeMs;
+                if (mt > t) t = mt;
+            } catch (e) { }
+        }
+        return t;
+    }
+    for (const sol of solutions) {
+        const t = Math.max(maxMtime(sbmScriptFolder, sol.sbmscripts), maxMtime(javascriptFolder, sol.javascripts));
+        if (t > bestT) { bestT = t; best = sol.name; }
+    }
+    return best;
+}
+exports.getMainSolutionName = getMainSolutionName;
 // Switch the active repository at runtime (no extension-host restart needed).
 // Recomputes all folder paths, reloads solutions, refreshes the tree and re-arms the watchers.
 function setRepository(repo) {
@@ -32,6 +182,8 @@ function setRepository(repo) {
         throw new Error(`Repository folder not found: ${solutionsFolder}`);
     }
     solutions.length = 0;  // drop the previous repository's solutions before loading the new one
+    fieldIndex = null;     // rebuild the table/field index for the new repository on next hover
+    scriptIndex = null;    // rebuild the script symbol index for the new repository
     refreshSolutions();
     if (activeProvider) {
         activeProvider.data = [];      // clear cached tree items from the old repository
@@ -306,9 +458,11 @@ class TreeDataProvider {
         for (const w of watchers) { try { w.close(); } catch (e) { } }
         watchers = [];
         var debouncedWatchFunction = debounce(_ => {
+            scriptIndex = null;  // script contents changed → rebuild symbol index on next use
             this.setDataTree();
         }, 300, false);
         var debouncedWatchFunctionSolutions = debounce(_ => {
+            scriptIndex = null;
             refreshSolutions();
             this.setDataTree();
         }, 300, false);
@@ -326,6 +480,7 @@ class TreeDataProvider {
     setDataTree() {
         this.data = [];
         this.fullData = [];
+        const scannedCheckedOut = [];  // collected during this scan
         for (let sol of solutions) {
             let solution;
             let create = false;
@@ -349,7 +504,11 @@ class TreeDataProvider {
                 if (sol.javascripts) {
                     for (let script of sol.javascripts) {
                         let isCheckedout = isComposerFileCheckedOut(`${javascriptFolder}\\${script.PartID}`);
-                        solution.children[0].children.push(new TreeItem(`${script.Name} - ${(isCheckedout) ? "C" : "X"}`, undefined, `${sol.name}/${script.PartID}#javascript`, `${(isCheckedout) ? "Checked out" : "Locked"}`));
+                        const jsId = `${sol.name}/${script.PartID}#javascript`;
+                        if (isCheckedout) scannedCheckedOut.push({ id: jsId, name: script.Name, solution: sol.name, type: 'javascript' });
+                        const jsItem = new TreeItem(`${script.Name} - ${(isCheckedout) ? "C" : "X"}`, undefined, jsId, `${(isCheckedout) ? "Checked out" : "Locked"}`);
+                        try { jsItem.iconPath = pathjs.join(this.context.extensionPath, 'media', 'js.svg'); } catch (e) { }
+                        solution.children[0].children.push(jsItem);
                         try {
                             this.openResource(`${sol.name}/${script.PartID}#javascript`, false);
                         } catch (error) {
@@ -363,7 +522,11 @@ class TreeDataProvider {
                 if (sol.sbmscripts) {
                     for (let script of sol.sbmscripts) {
                         let isCheckedout = isComposerFileCheckedOut(`${sbmScriptFolder}\\${script.PartID}`);
-                        solution.children[1].children.push(new TreeItem(`${script.Name} - ${(isCheckedout) ? "C" : "X"}`, undefined, `${sol.name}/${script.PartID}#script`, `${(isCheckedout) ? "Checked out" : "Locked"}`));
+                        const scId = `${sol.name}/${script.PartID}#script`;
+                        if (isCheckedout) scannedCheckedOut.push({ id: scId, name: script.Name, solution: sol.name, type: 'script' });
+                        const scItem = new TreeItem(`${script.Name} - ${(isCheckedout) ? "C" : "X"}`, undefined, scId, `${(isCheckedout) ? "Checked out" : "Locked"}`);
+                        try { scItem.iconPath = pathjs.join(this.context.extensionPath, 'media', 'modscript.svg'); } catch (e) { }
+                        solution.children[1].children.push(scItem);
                         let file = readComposerFile(`${sbmScriptFolder}\\${script.PartID}`);
                         let content = file.TtScript.Content;
                         let name = file.TtScript.Name + ".tscm";
@@ -387,6 +550,25 @@ class TreeDataProvider {
                 this.fullData.push(solution);
             }
         }
+        // ── Checkout tracking: detect newly checked-out scripts and auto-open them ──
+        const newIds = new Set(scannedCheckedOut.map(s => s.id));
+        if (checkoutInitialized) {
+            for (const s of scannedCheckedOut) {
+                if (!knownCheckoutIds.has(s.id)) {
+                    openScriptById(s.id);  // X → C transition: open it in an editor tab
+                }
+            }
+            // C → X transition (check-in): reload content so any open editor reflects the cache
+            for (const oldId of knownCheckoutIds) {
+                if (!newIds.has(oldId)) {
+                    try { this.openResource(oldId, false); } catch (e) { console.error('[checkin reload]', e); }
+                }
+            }
+        }
+        knownCheckoutIds = newIds;
+        checkedOutScripts = scannedCheckedOut;
+        checkoutInitialized = true;
+        checkoutEmitter.fire();  // refresh the "Checked out" view
         this.refresh();
         if (this.activeFilter.active) {
             this.filter(this.activeFilter.query, this.activeFilter.fuzzy);
@@ -583,6 +765,10 @@ class TreeItem extends vscode.TreeItem {
         this.id = id;
         this.tooltip = tooltip;
         this.command = { command: 'composerExplorer.openFile', title: "Open File", arguments: [this.id] };
+        // Leaf items are scripts → tag them so the "Add to favourites" context menu can target them
+        if (children === undefined && typeof id === 'string' && id.indexOf('#') >= 0) {
+            this.contextValue = 'composerScript';
+        }
     }
 }
 function debounce(func, wait, immediate) {

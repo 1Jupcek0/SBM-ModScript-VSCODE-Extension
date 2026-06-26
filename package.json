@@ -50,6 +50,21 @@
 					"visibility": "visible"
 				},
 				{
+					"id": "modscriptCheckedOut",
+					"name": "Checked Out",
+					"icon": "media/Composer.svg"
+				},
+				{
+					"id": "modscriptFavourites",
+					"name": "Favourites",
+					"icon": "media/Composer.svg"
+				},
+				{
+					"id": "modscriptKnowledgeBase",
+					"name": "Code Snippets",
+					"icon": "media/Composer.svg"
+				},
+				{
 					"id": "modscriptOutline",
 					"name": "Modscript Outline",
 					"icon": "media/Composer2.svg"
@@ -102,6 +117,34 @@
 				"title": "Modscript: Open Welcome"
 			},
 			{
+				"command": "extension.addFavourite",
+				"title": "Add to Favourites",
+				"icon": "$(star-empty)"
+			},
+			{
+				"command": "extension.removeFavourite",
+				"title": "Remove from Favourites",
+				"icon": "$(star-delete)"
+			},
+			{
+				"command": "extension.kbAdd",
+				"title": "Code Snippets: Add Snippet",
+				"icon": "$(add)"
+			},
+			{
+				"command": "extension.kbAddFromSelection",
+				"title": "Modscript: Save Selection to Code Snippets"
+			},
+			{
+				"command": "extension.kbDelete",
+				"title": "Delete Snippet",
+				"icon": "$(trash)"
+			},
+			{
+				"command": "extension.kbInsert",
+				"title": "Insert Snippet"
+			},
+			{
 				"command": "extension.openComposerExplorer",
 				"title": "Open Composer Explorer"
 			},
@@ -142,6 +185,26 @@
 			{
 				"command": "extension.outlineMethodShow",
 				"title": "Show methods",
+				"icon": "$(eye-closed)"
+			},
+			{
+				"command": "extension.outlineGlobalHide",
+				"title": "Hide global variables",
+				"icon": "$(symbol-variable)"
+			},
+			{
+				"command": "extension.outlineGlobalShow",
+				"title": "Show global variables",
+				"icon": "$(eye-closed)"
+			},
+			{
+				"command": "extension.outlineInstanceHide",
+				"title": "Hide class instances",
+				"icon": "$(symbol-object)"
+			},
+			{
+				"command": "extension.outlineInstanceShow",
+				"title": "Show class instances",
 				"icon": "$(eye-closed)"
 			}
 		],
@@ -218,9 +281,63 @@
 					"group": "navigation@3"
 				},
 				{
+					"command": "extension.outlineGlobalHide",
+					"when": "view == modscriptOutline && modscript.outlineShowGlobals",
+					"group": "navigation@4"
+				},
+				{
+					"command": "extension.outlineGlobalShow",
+					"when": "view == modscriptOutline && !modscript.outlineShowGlobals",
+					"group": "navigation@4"
+				},
+				{
+					"command": "extension.outlineInstanceHide",
+					"when": "view == modscriptOutline && modscript.outlineShowInstances",
+					"group": "navigation@5"
+				},
+				{
+					"command": "extension.outlineInstanceShow",
+					"when": "view == modscriptOutline && !modscript.outlineShowInstances",
+					"group": "navigation@5"
+				},
+				{
 					"command": "extension.openClassBrowser",
 					"when": "view == modscriptOutline",
-					"group": "navigation@4"
+					"group": "navigation@6"
+				},
+				{
+					"command": "extension.kbAdd",
+					"when": "view == modscriptKnowledgeBase",
+					"group": "navigation"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "extension.addFavourite",
+					"when": "view == composerExplorer && viewItem == composerScript",
+					"group": "inline"
+				},
+				{
+					"command": "extension.addFavourite",
+					"when": "view == modscriptCheckedOut && viewItem == checkedOutScript",
+					"group": "inline"
+				},
+				{
+					"command": "extension.removeFavourite",
+					"when": "view == modscriptFavourites && viewItem == favouriteScript",
+					"group": "inline"
+				},
+				{
+					"command": "extension.kbDelete",
+					"when": "view == modscriptKnowledgeBase && viewItem == kbEntry",
+					"group": "inline"
+				}
+			],
+			"editor/context": [
+				{
+					"command": "extension.kbAddFromSelection",
+					"when": "editorLangId == modscript && editorHasSelection",
+					"group": "modscript"
 				}
 			]
 		},
@@ -242,6 +359,11 @@
 					],
 					"default": "1",
 					"description": "Local Cache Path > Project: Specifies the folder path of the repository, that will be used and shown in Composer Explorer. These folders are named with a number and are located in Local Cache Path (You can find it in SBM Composer Options > Connection > Local Cache Path), from there, select any folder. \nExample: Local Cache Path is C:\\Users\\<username>\\AppData\\Local\\Serena\\Studio\\Repository\\Local, there are folders: ...\\Local\\0, ...\\Local\\1 and ...\\Local\\2, find out which project you need to open and write corresponding number: \"1\"."
+				},
+				"modscript.checkUndefinedVariables": {
+					"type": "boolean",
+					"default": true,
+					"description": "Warn when a variable reference is not defined anywhere in the current script or its includes. Turn off if it reports too many false positives."
 				}
 			}
 		}
