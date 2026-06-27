@@ -2133,6 +2133,9 @@ function activate(context) {
                 languageKeywords.forEach(addName);
                 ['true', 'false', 'null', 'this', 'fun', 'attr', 'global', 'in', 'is', 'new', 'void', 'me',
                  'class', 'include', 'do', 'then', 'and', 'or', 'not', 'each', 'as'].forEach(addName);
+                // Type keywords (used in typed params / declarations: def f(bool x), var x is int, ...)
+                ['bool', 'int', 'integer', 'string', 'double', 'float', 'long', 'date', 'datetime', 'time',
+                 'variant', 'object', 'char', 'byte', 'short', 'decimal', 'number'].forEach(addName);
                 for (const v of varList) addName(v.variable);
                 for (const f of newMeathods) addName(f.meathodName);
                 for (const c of newClasses) { addName(c.className); for (const m of (c.meathods || [])) addName(m.meathodName); for (const p of (c.properties || [])) addName(p.propertyName); }
@@ -2141,10 +2144,11 @@ function activate(context) {
                     for (const m of (cls.meathods || [])) addName(m.meathodName);
                     for (const p of (cls.properties || [])) addName(p.propertyName);
                 }
-                // Repo-wide identifiers (covers lib.core + anything used across scripts)
+                // Repo-wide identifiers + globals (covers lib.core, VarType_*, RegexOptionBitsConstants, etc.)
                 try {
                     const idx = ComposerController_1.getScriptIndex();
                     if (idx && idx.usage) for (const k of Object.keys(idx.usage)) known.add(k);
+                    if (idx && idx.globals) for (const k of Object.keys(idx.globals)) known.add(k);
                 } catch (e) { }
 
                 // Build a comment-free, string-free mask of each line (handles /* */ across lines)
@@ -2428,6 +2432,30 @@ function buildClassBrowserData() {
                 props: (cls.properties || []).map(p => ({ name: p.propertyName || '', type: p.propertyType || '', desc: p.propertyDescription || '' })) });
         }
     }
+    // Global variables (and class instances) — mirror the outline's variable sections
+    const seenG = new Set();
+    const sbmClassByName = {};
+    for (const [, c] of Object.entries(classes)) { if (c.className) sbmClassByName[c.className] = c; }
+    for (const [uri, vars] of Object.entries(globalVars)) {
+        for (const v of (vars || [])) {
+            if (!v.variable || !v.GlobalScope) continue;
+            if (seenG.has(v.variable)) continue; seenG.add(v.variable);
+            const line = typeof v.declarationLine === 'number' ? v.declarationLine : (v.range ? v.range.start.line : -1);
+            // Is it a class instance? Pull the class's methods so they show in the detail pane.
+            let cls = null;
+            if (v.type) {
+                cls = (globalClasses[uri] || []).find(c => c.className === v.type) || sbmClassByName[v.type] || null;
+            }
+            const isInstance = !!(cls && (cls.meathods || []).length);
+            items.push({
+                id: 'ug_' + v.variable, name: v.variable, kind: isInstance ? 'user-instance' : 'user-global',
+                src: 'user', uri, line, ret: v.type || '', owner: v.type || '',
+                desc: isInstance ? `Global instance of ${v.type}` : (v.type ? `Global variable of type ${v.type}` : 'Global variable'),
+                methods: isInstance ? (cls.meathods || []).map(m => ({ name: m.meathodName, desc: m.meathodDescription || '',
+                    params: (m.meathodParms || []).map(pmap), ret: m.meathodReturn || 'Void' })) : []
+            });
+        }
+    }
     return items;
 }
 
@@ -2476,6 +2504,8 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
     <span class="pill on" data-k="user-function">Custom functions</span>
     <span class="pill on" data-k="user-method">Object methods</span>
     <span class="pill on" data-k="user-class">Custom classes</span>
+    <span class="pill on" data-k="user-global">Global variables</span>
+    <span class="pill on" data-k="user-instance">Class instances</span>
     <span class="pill on" data-k="function">SBM functions</span>
     <span class="pill on" data-k="class">SBM classes</span>
   </div>
@@ -2488,13 +2518,15 @@ body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size
 (function() {
 var vsc = acquireVsCodeApi();
 var ALL = [], FIL = [], SEL = -1;
-var AK = { 'class': true, 'function': true, 'user-class': true, 'user-function': true, 'user-method': true };
+var AK = { 'class': true, 'function': true, 'user-class': true, 'user-function': true, 'user-method': true, 'user-global': true, 'user-instance': true };
 
 // Section order in the list (top to bottom)
 var SECTIONS = [
   { key: 'user-function', label: 'Custom functions' },
   { key: 'user-method',   label: 'Object methods', byOwner: true },
   { key: 'user-class',    label: 'Custom classes' },
+  { key: 'user-instance', label: 'Class instances' },
+  { key: 'user-global',   label: 'Global variables' },
   { key: 'function',      label: 'SBM functions' },
   { key: 'class',         label: 'SBM classes' }
 ];
@@ -2508,12 +2540,14 @@ document.querySelectorAll('.pill').forEach(function(el) {
   });
 });
 
-var ICONS = { 'class': '[C]', 'function': '[F]', 'user-class': '[U]', 'user-function': '[fn]', 'user-method': '[m]' };
+var ICONS = { 'class': '[C]', 'function': '[F]', 'user-class': '[U]', 'user-function': '[fn]', 'user-method': '[m]', 'user-global': '[g]', 'user-instance': '[o]' };
 function ic(k) { return ICONS[k] || '[-]'; }
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function buildSig(it) {
   if (it.kind==='class'||it.kind==='user-class') return 'class ' + it.name + ' { ' + (it.methods||[]).length + ' methods, ' + (it.props||[]).length + ' properties }';
+  if (it.kind==='user-instance') return 'global ' + it.name + ' = ' + (it.owner||'?') + '()  { ' + (it.methods||[]).length + ' methods }';
+  if (it.kind==='user-global') return 'global ' + it.name + (it.ret ? ': ' + it.ret : '');
   var p = (it.params||[]).map(function(p){ return (p.opt?'[':'')+p.name+': '+p.type+(p.opt?']':''); }).join(', ');
   if (it.kind==='user-method') return (it.owner?it.owner+'.':'')+it.name+'('+p+'): '+(it.ret||'Void');
   return (it.kind==='user-function'?'def ':'')+it.name+'('+p+'): '+(it.ret||'Void');
@@ -2574,7 +2608,7 @@ document.getElementById('DP').addEventListener('click', function(e) {
 });
 
 function kindLabel(k) {
-  return { 'class':'class', 'function':'function', 'user-class':'class', 'user-function':'function', 'user-method':'method' }[k] || k;
+  return { 'class':'class', 'function':'function', 'user-class':'class', 'user-function':'function', 'user-method':'method', 'user-global':'global variable', 'user-instance':'class instance' }[k] || k;
 }
 
 function sel(i) {

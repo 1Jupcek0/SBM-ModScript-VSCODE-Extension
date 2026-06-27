@@ -77,19 +77,30 @@ exports.getFieldIndex = getFieldIndex;
 // include() quick-fix knows which script to import.
 let scriptIndex = null;
 function buildScriptIndex() {
-    const symbolToScript = {};  // lowercased symbol -> defining script base name (e.g. SOAR_CLASS_AuxCity)
+    const symbolToScript = {};  // lowercased symbol -> defining script base name (e.g. SoAR_CLASS_AuxCity)
     const freq = {};            // lowercased declared symbol -> usage count across all scripts
     const usage = {};           // lowercased ANY identifier -> total occurrences across all scripts
+    const globals = {};         // lowercased global variable name -> defining script base name
     const symbols = {};         // lowercased symbol -> { name, kind, script }
     const contents = [];        // { base, text } for the frequency pass
-    function readContent(folder, partID, isJs) {
+    // Lightweight content reader (just the script body, no .meta/.S) for the whole folder
+    function readBody(folder, partID, contentKey) {
         try {
-            const f = readComposerFile(`${folder}\\${partID}`);
-            return isJs ? (f.JavascriptPart && f.JavascriptPart.Content) : (f.TtScript && f.TtScript.Content);
-        } catch (e) { return null; }
+            const p = `${folder}\\${partID}`;
+            const nums = fs.readdirSync(p).filter(f => /^\d+$/.test(f)).map(Number);
+            if (!nums.length) return { name: null, text: null };
+            const h = Math.max(...nums);
+            const file = fs.existsSync(`${p}\\${h}.#`) ? `${p}\\${h}.#` : `${p}\\${h}`;
+            const j = JSON.parse(convert.xml2json(zlib.gunzipSync(fs.readFileSync(file)).toString('utf8'), { compact: true }));
+            const obj = j[contentKey];
+            if (!obj) return { name: null, text: null };
+            const tx = v => (v && (v._text !== undefined ? v._text : v)) || '';
+            return { name: tx(obj.Name), text: tx(obj.Content) };
+        } catch (e) { return { name: null, text: null }; }
     }
     const classRe = /(?:^|[^\w.])class\s+([A-Za-z_]\w*)/g;
     const defRe = /(?:^|[^\w.])def\s+(?:([A-Za-z_]\w*)::)?([A-Za-z_]\w*)\s*\(/g;
+    const globalRe = /(?:^|[^\w.])global\s+([A-Za-z_]\w*)/g;
     function declare(name, kind, base) {
         if (!name) return;
         const k = name.toLowerCase();
@@ -98,27 +109,25 @@ function buildScriptIndex() {
             symbolToScript[k] = base;
         }
     }
-    try {
-        for (const sol of solutions) {
-            for (const sc of (sol.sbmscripts || [])) {
-                const text = readContent(sbmScriptFolder, sc.PartID, false);
-                if (!text) continue;
-                const base = sc.Name;
-                contents.push({ base, text });
-                let m;
-                classRe.lastIndex = 0; while ((m = classRe.exec(text))) declare(m[1], 'class', base);
-                defRe.lastIndex = 0; while ((m = defRe.exec(text))) { if (m[1]) declare(m[1], 'class', base); else declare(m[2], 'function', base); }
-            }
-            for (const js of (sol.javascripts || [])) {
-                const text = readContent(javascriptFolder, js.PartID, true);
-                if (!text) continue;
-                const base = js.Name;
-                contents.push({ base, text });
-                let m;
-                classRe.lastIndex = 0; while ((m = classRe.exec(text))) declare(m[1], 'class', base);
-                defRe.lastIndex = 0; while ((m = defRe.exec(text))) { if (m[1]) declare(m[1], 'class', base); else declare(m[2], 'function', base); }
-            }
+    function scanFolder(folder, contentKey) {
+        let dirs;
+        try { dirs = fs.readdirSync(folder); } catch (e) { return; }
+        for (const d of dirs) {
+            const { name, text } = readBody(folder, d, contentKey);
+            if (!text) continue;
+            const base = name || d;
+            contents.push({ base, text });
+            let m;
+            classRe.lastIndex = 0; while ((m = classRe.exec(text))) declare(m[1], 'class', base);
+            defRe.lastIndex = 0; while ((m = defRe.exec(text))) { if (m[1]) declare(m[1], 'class', base); else declare(m[2], 'function', base); }
+            globalRe.lastIndex = 0; while ((m = globalRe.exec(text))) { const g = m[1].toLowerCase(); if (!globals[g]) globals[g] = base; }
         }
+    }
+    try {
+        // Scan ALL scripts directly (not just those referenced by solutions) so every symbol
+        // and global — including library scripts like lbms.lib.core — is covered.
+        scanFolder(sbmScriptFolder, 'TtScript');
+        scanFolder(javascriptFolder, 'JavascriptPart');
         // Frequency pass: count every identifier across all sources.
         // - freq:  occurrences of declared class/function symbols (for the symbol-completion list)
         // - usage: occurrences of ALL identifiers (drives usage-based ranking + "known" set for diagnostics,
@@ -134,7 +143,7 @@ function buildScriptIndex() {
         }
     } catch (e) { console.error('[scriptIndex]', e); }
     return {
-        symbolToScript, freq, usage,
+        symbolToScript, freq, usage, globals,
         symbols: Object.values(symbols).map(s => ({ ...s, freq: freq[s.name.toLowerCase()] || 0 }))
     };
 }
@@ -149,6 +158,7 @@ function getMainSolutionName() {
     let best = null, bestT = -1;
     function maxMtime(folder, arr) {
         let t = 0;
+        if (arr && !Array.isArray(arr)) arr = [arr];
         for (const x of (arr || [])) {
             try {
                 const p = `${folder}\\${x.PartID}`;
@@ -558,10 +568,11 @@ class TreeDataProvider {
                     openScriptById(s.id);  // X → C transition: open it in an editor tab
                 }
             }
-            // C → X transition (check-in): reload content so any open editor reflects the cache
+            // C → X transition (check-in): reload the script from disk and re-apply read-only
+            // (openResource with true refreshes content in the open editor and sets read-only mode)
             for (const oldId of knownCheckoutIds) {
                 if (!newIds.has(oldId)) {
-                    try { this.openResource(oldId, false); } catch (e) { console.error('[checkin reload]', e); }
+                    try { this.openResource(oldId, true); } catch (e) { console.error('[checkin reload]', e); }
                 }
             }
         }
