@@ -45,28 +45,33 @@
 			"composer-explorer": [
 				{
 					"id": "composerExplorer",
-					"name": "Composer Explorer",
+					"name": "%view.composerExplorer%",
 					"icon": "media/Composer.svg",
 					"visibility": "visible"
 				},
 				{
 					"id": "modscriptCheckedOut",
-					"name": "Checked Out",
+					"name": "%view.checkedOut%",
 					"icon": "media/Composer.svg"
 				},
 				{
 					"id": "modscriptFavourites",
-					"name": "Favourites",
+					"name": "%view.favourites%",
 					"icon": "media/Composer.svg"
 				},
 				{
 					"id": "modscriptKnowledgeBase",
-					"name": "Code Snippets",
+					"name": "%view.codeSnippets%",
+					"icon": "media/Composer.svg"
+				},
+				{
+					"id": "modscriptTools",
+					"name": "%view.tools%",
 					"icon": "media/Composer.svg"
 				},
 				{
 					"id": "modscriptOutline",
-					"name": "Modscript Outline",
+					"name": "%view.outline%",
 					"icon": "media/Composer2.svg"
 				}
 			]
@@ -109,40 +114,50 @@
 			},
 			{
 				"command": "extension.openSettingsPanel",
-				"title": "Modscript: Open settings panel",
+				"title": "%cmd.openSettings%",
 				"icon": "$(settings)"
 			},
 			{
 				"command": "extension.openWelcome",
-				"title": "Modscript: Open Welcome"
+				"title": "%cmd.openWelcome%"
+			},
+			{
+				"command": "extension.openEventViewer",
+				"title": "%cmd.openEventViewer%",
+				"icon": "$(output)"
+			},
+			{
+				"command": "extension.searchAllScripts",
+				"title": "%cmd.searchAllScripts%",
+				"icon": "$(search)"
 			},
 			{
 				"command": "extension.addFavourite",
-				"title": "Add to Favourites",
+				"title": "%cmd.addFavourite%",
 				"icon": "$(star-empty)"
 			},
 			{
 				"command": "extension.removeFavourite",
-				"title": "Remove from Favourites",
+				"title": "%cmd.removeFavourite%",
 				"icon": "$(star-delete)"
 			},
 			{
 				"command": "extension.kbAdd",
-				"title": "Code Snippets: Add Snippet",
+				"title": "%cmd.kbAdd%",
 				"icon": "$(add)"
 			},
 			{
 				"command": "extension.kbAddFromSelection",
-				"title": "Modscript: Save Selection to Code Snippets"
+				"title": "%cmd.kbAddSel%"
 			},
 			{
 				"command": "extension.kbDelete",
-				"title": "Delete Snippet",
+				"title": "%cmd.kbDelete%",
 				"icon": "$(trash)"
 			},
 			{
 				"command": "extension.kbInsert",
-				"title": "Insert Snippet"
+				"title": "%cmd.kbInsert%"
 			},
 			{
 				"command": "extension.openComposerExplorer",
@@ -150,7 +165,7 @@
 			},
 			{
 				"command": "extension.openClassBrowser",
-				"title": "Modscript: Open Reference Browser",
+				"title": "%cmd.openReference%",
 				"icon": "$(library)"
 			},
 			{
@@ -247,6 +262,16 @@
 				},
 				{
 					"command": "extension.openSettingsPanel",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.openEventViewer",
+					"when": "view == composerExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "extension.searchAllScripts",
 					"when": "view == composerExplorer",
 					"group": "navigation"
 				},
@@ -359,6 +384,26 @@
 					],
 					"default": "1",
 					"description": "Local Cache Path > Project: Specifies the folder path of the repository, that will be used and shown in Composer Explorer. These folders are named with a number and are located in Local Cache Path (You can find it in SBM Composer Options > Connection > Local Cache Path), from there, select any folder. \nExample: Local Cache Path is C:\\Users\\<username>\\AppData\\Local\\Serena\\Studio\\Repository\\Local, there are folders: ...\\Local\\0, ...\\Local\\1 and ...\\Local\\2, find out which project you need to open and write corresponding number: \"1\"."
+				},
+				"modscript.enableCompletion": {
+					"type": "boolean",
+					"default": true,
+					"description": "Code completion (IntelliSense): suggest keywords, snippets, classes, functions and project symbols as you type."
+				},
+				"modscript.enableDiagnostics": {
+					"type": "boolean",
+					"default": true,
+					"description": "Error checking: underline problems (such as undefined variables) and list them under \"Composer problems\"."
+				},
+				"modscript.enableHover": {
+					"type": "boolean",
+					"default": true,
+					"description": "Hover tooltips: show a symbol type and description when you hover over it."
+				},
+				"modscript.enableSignatureHelp": {
+					"type": "boolean",
+					"default": true,
+					"description": "Parameter hints: show function parameters while you type a call."
 				},
 				"modscript.checkUndefinedVariables": {
 					"type": "boolean",

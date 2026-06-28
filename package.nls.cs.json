@@ -1,0 +1,19 @@
+{
+  "view.composerExplorer": "Composer Explorer",
+  "view.checkedOut": "Vyhlášené skripty",
+  "view.favourites": "Oblíbené",
+  "view.codeSnippets": "Úryvky kódu",
+  "view.outline": "Modscript Osnova",
+  "cmd.openSettings": "Modscript: Otevřít nastavení",
+  "cmd.openWelcome": "Modscript: Otevřít úvodní stránku",
+  "cmd.openReference": "Modscript: Otevřít prohlížeč referencí",
+  "cmd.openEventViewer": "Modscript: Otevřít prohlížeč událostí Windows",
+  "cmd.addFavourite": "Přidat do oblíbených",
+  "cmd.removeFavourite": "Odebrat z oblíbených",
+  "cmd.kbAdd": "Úryvky kódu: Přidat úryvek",
+  "cmd.kbAddSel": "Modscript: Uložit výběr do úryvků kódu",
+  "cmd.kbDelete": "Smazat úryvek",
+  "cmd.kbInsert": "Vložit úryvek",
+  "view.tools": "Konfigurace a nástroje",
+  "cmd.searchAllScripts": "Modscript: Hledat ve všech skriptech"
+}

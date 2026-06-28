@@ -179,6 +179,58 @@ function getMainSolutionName() {
     return best;
 }
 exports.getMainSolutionName = getMainSolutionName;
+// Flat list of every script with the id used by composerExplorer.openFile
+function getAllScripts() {
+    const out = [];
+    const asArr = a => Array.isArray(a) ? a : (a ? [a] : []);
+    for (const sol of solutions) {
+        for (const sc of asArr(sol.sbmscripts)) {
+            if (sc && sc.PartID) out.push({ name: sc.Name, solution: sol.name, type: 'script', id: `${sol.name}/${sc.PartID}#script` });
+        }
+        for (const js of asArr(sol.javascripts)) {
+            if (js && js.PartID) out.push({ name: js.Name, solution: sol.name, type: 'javascript', id: `${sol.name}/${js.PartID}#javascript` });
+        }
+    }
+    out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    return out;
+}
+exports.getAllScripts = getAllScripts;
+// Full text of every script, cached, for the "Search everywhere" window.
+let contentCache = null;
+function getScriptContents() {
+    if (contentCache) return contentCache;
+    const out = [];
+    const asArr = a => Array.isArray(a) ? a : (a ? [a] : []);
+    function readText(folder, partID, key) {
+        try {
+            const p = `${folder}\\${partID}`;
+            const nums = fs.readdirSync(p).filter(f => /^\d+$/.test(f)).map(Number);
+            if (!nums.length) return null;
+            const h = Math.max(...nums);
+            const file = fs.existsSync(`${p}\\${h}.#`) ? `${p}\\${h}.#` : `${p}\\${h}`;
+            const j = JSON.parse(convert.xml2json(zlib.gunzipSync(fs.readFileSync(file)).toString('utf8'), { compact: true }));
+            const o = j[key];
+            return o && o.Content && (o.Content._text !== undefined ? o.Content._text : o.Content) || '';
+        } catch (e) { return null; }
+    }
+    for (const sol of solutions) {
+        for (const sc of asArr(sol.sbmscripts)) {
+            if (!sc || !sc.PartID) continue;
+            const text = readText(sbmScriptFolder, sc.PartID, 'TtScript');
+            if (text != null) out.push({ name: sc.Name, solution: sol.name, type: 'script', id: `${sol.name}/${sc.PartID}#script`, text });
+        }
+        for (const js of asArr(sol.javascripts)) {
+            if (!js || !js.PartID) continue;
+            const text = readText(javascriptFolder, js.PartID, 'JavascriptPart');
+            if (text != null) out.push({ name: js.Name, solution: sol.name, type: 'javascript', id: `${sol.name}/${js.PartID}#javascript`, text });
+        }
+    }
+    contentCache = out;
+    return out;
+}
+function invalidateContentCache() { contentCache = null; }
+exports.getScriptContents = getScriptContents;
+exports.invalidateContentCache = invalidateContentCache;
 // Switch the active repository at runtime (no extension-host restart needed).
 // Recomputes all folder paths, reloads solutions, refreshes the tree and re-arms the watchers.
 function setRepository(repo) {
@@ -194,6 +246,7 @@ function setRepository(repo) {
     solutions.length = 0;  // drop the previous repository's solutions before loading the new one
     fieldIndex = null;     // rebuild the table/field index for the new repository on next hover
     scriptIndex = null;    // rebuild the script symbol index for the new repository
+    contentCache = null;   // rebuild the full-text search cache
     refreshSolutions();
     if (activeProvider) {
         activeProvider.data = [];      // clear cached tree items from the old repository
@@ -415,6 +468,11 @@ class TreeDataProvider {
         this.data = [];
         this.fullData = [];
         this.activeFilter = { active: false, query: "", fuzzy: false };
+        this.backups = {};  // id -> { name, content } original snapshot taken at checkout
+        try {
+            this.backupDir = pathjs.join(context.globalStorageUri ? context.globalStorageUri.fsPath : context.globalStoragePath, 'script-backups');
+            fs.mkdirSync(this.backupDir, { recursive: true });
+        } catch (e) { this.backupDir = null; }
         // console.log(this.memFs);
         context.subscriptions.push(vscode.workspace.registerFileSystemProvider(MEM_FS_SCHEMA, this.memFs, {
             isCaseSensitive: true,
@@ -468,11 +526,11 @@ class TreeDataProvider {
         for (const w of watchers) { try { w.close(); } catch (e) { } }
         watchers = [];
         var debouncedWatchFunction = debounce(_ => {
-            scriptIndex = null;  // script contents changed → rebuild symbol index on next use
+            scriptIndex = null; contentCache = null;  // script contents changed → rebuild caches on next use
             this.setDataTree();
         }, 300, false);
         var debouncedWatchFunctionSolutions = debounce(_ => {
-            scriptIndex = null;
+            scriptIndex = null; contentCache = null;
             refreshSolutions();
             this.setDataTree();
         }, 300, false);
@@ -486,6 +544,36 @@ class TreeDataProvider {
     }
     refresh() {
         this._onDidChangeTreeData.fire(undefined);
+    }
+    // Take a clean snapshot of a script when it gets checked out, so we can restore the
+    // original on check-in without depending on the export/import round-trip.
+    backupScript(id) {
+        try {
+            const isJs = id.includes('#javascript');
+            const folder = isJs ? javascriptFolder : sbmScriptFolder;
+            const key = isJs ? 'JavascriptPart' : 'TtScript';
+            const partID = id.split('#')[0].split('/')[1];
+            const f = readComposerFile(`${folder}\\${partID}`);
+            const obj = f[key];
+            if (!obj) return;
+            const content = obj.Content;
+            const ext = isJs ? '.js' : (obj.SyntaxType == 'ModScript' ? '.tscm' : '.vb');
+            const name = id.split('/')[0] + '/' + obj.Name + ext;
+            this.backups[id] = { name, content };
+            if (this.backupDir) {
+                try { fs.writeFileSync(pathjs.join(this.backupDir, partID + ext), content); } catch (e) { }
+            }
+        } catch (e) { console.error('[backupScript]', id, e); }
+    }
+    // Restore the snapshot taken at checkout into the open editor on check-in.
+    restoreScript(id) {
+        try {
+            const b = this.backups[id];
+            if (!b) { this.openResource(id, true); return; }  // no snapshot → fall back to disk reload
+            const uri = vscode.Uri.parse(`${MEM_FS_SCHEMA}:/${b.name}`);
+            this.memFs.writeFile(uri, Buffer.from(b.content), { create: true, overwrite: true });
+            vscode.workspace.openTextDocument(uri).then(doc => vscode.window.showTextDocument(doc));
+        } catch (e) { console.error('[restoreScript]', id, e); }
     }
     setDataTree() {
         this.data = [];
@@ -565,14 +653,14 @@ class TreeDataProvider {
         if (checkoutInitialized) {
             for (const s of scannedCheckedOut) {
                 if (!knownCheckoutIds.has(s.id)) {
-                    openScriptById(s.id);  // X → C transition: open it in an editor tab
+                    this.backupScript(s.id);   // X → C: snapshot the original first
+                    openScriptById(s.id);      // then open it in an editor tab
                 }
             }
-            // C → X transition (check-in): reload the script from disk and re-apply read-only
-            // (openResource with true refreshes content in the open editor and sets read-only mode)
+            // C → X transition (check-in): restore the snapshot taken at checkout into the editor
             for (const oldId of knownCheckoutIds) {
                 if (!newIds.has(oldId)) {
-                    try { this.openResource(oldId, true); } catch (e) { console.error('[checkin reload]', e); }
+                    try { this.restoreScript(oldId); } catch (e) { console.error('[checkin restore]', e); }
                 }
             }
         }

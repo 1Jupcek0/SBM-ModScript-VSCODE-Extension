@@ -1,0 +1,19 @@
+{
+  "view.composerExplorer": "Composer Explorer",
+  "view.checkedOut": "Checked Out",
+  "view.favourites": "Favourites",
+  "view.codeSnippets": "Code Snippets",
+  "view.outline": "Modscript Outline",
+  "cmd.openSettings": "Modscript: Open settings panel",
+  "cmd.openWelcome": "Modscript: Open Welcome",
+  "cmd.openReference": "Modscript: Open Reference Browser",
+  "cmd.openEventViewer": "Modscript: Open Windows Event Viewer",
+  "cmd.addFavourite": "Add to Favourites",
+  "cmd.removeFavourite": "Remove from Favourites",
+  "cmd.kbAdd": "Code Snippets: Add Snippet",
+  "cmd.kbAddSel": "Modscript: Save Selection to Code Snippets",
+  "cmd.kbDelete": "Delete Snippet",
+  "cmd.kbInsert": "Insert Snippet",
+  "view.tools": "Configuration & Tools",
+  "cmd.searchAllScripts": "Modscript: Search All Scripts"
+}

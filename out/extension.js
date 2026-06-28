@@ -31,6 +31,8 @@ let outlineProvider;
 let classBrowserPanel = null;
 let settingsPanel = null;
 let welcomePanel = null;
+let eventViewerPanel = null;
+let scriptSearchPanel = null;
 const Ranges_1 = require("./Ranges");
 let languageKeywords = ["var", "global", "def", "try", "catch", "finally", "if", "else", "while", "for", "case", "default", "switch", "return", "break", "continue", "this"];
 /**
@@ -38,6 +40,104 @@ let languageKeywords = ["var", "global", "def", "try", "catch", "finally", "if",
  * 
  * @param {vscode.ExtensionContext} context - The context in which the extension is activated.
  */
+// Standalone diagnostics — runs independently of ParseDocument so a parse failure never hides errors.
+// Flags identifiers (including bare assignment targets like `kys = 123`) that are not declared
+// anywhere in the script, its includes, or the wider repository.
+function runDiagnostics(document) {
+    if (!diagnosticCollection || !document || document.languageId !== 'modscript') return;
+    const cfg = vscode.workspace.getConfiguration('modscript');
+    if (!cfg.get('enableDiagnostics', true) || !cfg.get('checkUndefinedVariables', true)) {
+        diagnosticCollection.set(document.uri, []);
+        return;
+    }
+    try {
+        const uri = document.uri.toString();
+        const varList = globalVars[uri] || [];
+        const newMeathods = globalFuncs[uri] || [];
+        const newClasses = globalClasses[uri] || [];
+        const known = new Set();
+        const addName = n => { if (n) known.add(String(n).toLowerCase()); };
+        languageKeywords.forEach(addName);
+        ['true', 'false', 'null', 'this', 'fun', 'attr', 'global', 'in', 'is', 'new', 'void', 'me',
+         'class', 'include', 'do', 'then', 'and', 'or', 'not', 'each', 'as'].forEach(addName);
+        ['bool', 'int', 'integer', 'string', 'double', 'float', 'long', 'date', 'datetime', 'time',
+         'variant', 'object', 'char', 'byte', 'short', 'decimal', 'number'].forEach(addName);
+        for (const v of varList) addName(v.variable);
+        for (const f of newMeathods) addName(f.meathodName);
+        for (const c of newClasses) { addName(c.className); for (const m of (c.meathods || [])) addName(m.meathodName); for (const p of (c.properties || [])) addName(p.propertyName); }
+        for (const [, cls] of Object.entries(classes)) {
+            if (cls.className) addName(cls.className);
+            for (const m of (cls.meathods || [])) addName(m.meathodName);
+            for (const p of (cls.properties || [])) addName(p.propertyName);
+        }
+        try {
+            const idx = ComposerController_1.getScriptIndex();
+            if (idx && idx.usage) for (const k of Object.keys(idx.usage)) known.add(k);
+            if (idx && idx.globals) for (const k of Object.keys(idx.globals)) known.add(k);
+        } catch (e) { }
+
+        // Comment/string-free mask of each line (handles /* */ across lines)
+        const masked = [];
+        let inBlock = false;
+        for (let li = 0; li < document.lineCount; li++) {
+            const raw = document.lineAt(li).text;
+            let out = '', j = 0;
+            while (j < raw.length) {
+                if (inBlock) {
+                    if (raw[j] === '*' && raw[j + 1] === '/') { inBlock = false; out += '  '; j += 2; }
+                    else { out += ' '; j++; }
+                } else if (raw[j] === '/' && raw[j + 1] === '*') { inBlock = true; out += '  '; j += 2; }
+                else if (raw[j] === '/' && raw[j + 1] === '/') { out += ' '.repeat(raw.length - j); break; }
+                else { out += raw[j]; j++; }
+            }
+            out = out.replace(/"[^"]*"/g, m => ' '.repeat(m.length)).replace(/'[^']*'/g, m => ' '.repeat(m.length));
+            masked.push(out);
+        }
+        // Local DECLARATIONS only (var/global/attr X, for-item, catch param, def params).
+        // Bare assignments (X = ... / X := ...) are NOT declarations — assigning to an
+        // undeclared name is an error and should be reported.
+        const fullMasked = masked.join('\n');
+        let dm;
+        const declRe = /\b(?:var|global|attr)\s+([A-Za-z_]\w*)/g;
+        while ((dm = declRe.exec(fullMasked))) addName(dm[1]);
+        const forRe = /\bfor\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*:/g;
+        while ((dm = forRe.exec(fullMasked))) addName(dm[1]);
+        const catchRe = /\bcatch\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*\)/g;
+        while ((dm = catchRe.exec(fullMasked))) addName(dm[1]);
+        const paramRe = /\bdef\s+(?:[A-Za-z_]\w*::)?[A-Za-z_]\w*\s*\(([^)]*)\)/g;
+        while ((dm = paramRe.exec(fullMasked))) {
+            for (let part of dm[1].split(',')) {
+                const toks = part.trim().split(/\s+/);
+                if (toks.length) addName(toks[toks.length - 1]);
+            }
+        }
+
+        const diags = [];
+        const reIdent = /[A-Za-z_]\w*/g;
+        for (let li = 0; li < masked.length; li++) {
+            const text = masked[li];
+            if (/^\s*include\s*\(/.test(text)) continue;
+            let m;
+            while ((m = reIdent.exec(text))) {
+                const word = m[0], start = m.index;
+                if (/^\d/.test(word)) continue;
+                const before = text.slice(0, start);
+                const after = text.slice(start + word.length);
+                if (/[.]\s*$/.test(before)) continue;                        // member access  x.word
+                if (/^\s*\(/.test(after)) continue;                          // function call   word(
+                if (/^\s*::/.test(after) || /::\s*$/.test(before)) continue;  // Class::method
+                if (/(?:\bdef|\bvar|\bglobal|\battr|\bclass|\bcase|\bcatch|\bfor)\s*[\(\s]$/.test(before)) continue; // declaration target
+                if (known.has(word.toLowerCase())) continue;
+                const range = new vscode.Range(li, start, li, start + word.length);
+                diags.push(new vscode.Diagnostic(range, `'${word}' is not defined in this script or its includes.`, vscode.DiagnosticSeverity.Error));
+            }
+        }
+        diagnosticCollection.set(document.uri, diags);
+    } catch (e) {
+        console.error('[runDiagnostics] failed for', document.uri.toString(), e);
+    }
+}
+
 // Re-rank completion items by how often each label is actually used across the project's scripts.
 // Items with explicit priority sortText ('~' snippets, '0_' repo symbols) are left untouched.
 function applyUsageRanking(items) {
@@ -98,7 +198,13 @@ function activate(context) {
                     if (count > bestCount) { bestCount = count; target = s; }
                 }
             }
-            if (target) treeView.reveal(target, { expand: 2, focus: false, select: false });
+            if (target) {
+                treeView.reveal(target, { expand: 1, focus: false, select: false });
+                // Expand BOTH the Javascript and Scripts folders of the application at once
+                for (const child of (target.children || [])) {
+                    try { treeView.reveal(child, { expand: 1, focus: false, select: false }); } catch (e) { }
+                }
+            }
         } catch (e) { console.error('[expandMainApplication]', e); }
     }
     setTimeout(expandMainApplication, 1500);
@@ -187,7 +293,14 @@ function activate(context) {
             root,
             repos,
             repositoryFolder: cfg.get('repositoryFolder') || '',
-            exportFolder: cfg.get('exportFolder') || ''
+            exportFolder: cfg.get('exportFolder') || '',
+            toggles: {
+                enableCompletion: cfg.get('enableCompletion', true),
+                enableDiagnostics: cfg.get('enableDiagnostics', true),
+                checkUndefinedVariables: cfg.get('checkUndefinedVariables', true),
+                enableHover: cfg.get('enableHover', true),
+                enableSignatureHelp: cfg.get('enableSignatureHelp', true)
+            }
         });
     }
 
@@ -222,6 +335,11 @@ function activate(context) {
                     const newRepo = String(msg.repositoryFolder || '');
                     await cfg.update('repositoryFolder', msg.repositoryFolder || null, vscode.ConfigurationTarget.Global);
                     await cfg.update('exportFolder', msg.exportFolder || null, vscode.ConfigurationTarget.Global);
+                    if (msg.toggles) {
+                        for (const [k, v] of Object.entries(msg.toggles)) {
+                            await cfg.update(k, !!v, vscode.ConfigurationTarget.Global);
+                        }
+                    }
                     settingsPanel.webview.postMessage({ cmd: 'saved' });
                     // Switch the Composer Explorer to the new repository live — no host restart,
                     // so it works every time you change it (including switching back).
@@ -269,6 +387,150 @@ function activate(context) {
     }
     context.subscriptions.push(vscode.commands.registerCommand('extension.openWelcome', openWelcome));
 
+    // ─── Windows Event Viewer panel ───────────────────────────────────────────
+    const cp = require('child_process');
+    // Hostname of the server the active repository is connected to (from stripe.tab)
+    function getRepoServerHost() {
+        try {
+            const repo = String(vscode.workspace.getConfiguration('modscript').get('repositoryFolder') || '');
+            const root = path.join(process.env.localappdata || '', 'Serena', 'Studio', 'Repository', 'Local');
+            const info = parseStripe(root)[repo];
+            if (info && info.url) {
+                const mm = info.url.match(/https?:\/\/([^:/]+)/i);
+                if (mm) return mm[1];
+            }
+        } catch (e) { }
+        return '';
+    }
+    // All distinct server hosts across every connected repository (for the Computer dropdown)
+    function getAllRepoHosts() {
+        const hosts = [];
+        try {
+            const root = path.join(process.env.localappdata || '', 'Serena', 'Studio', 'Repository', 'Local');
+            const map = parseStripe(root);
+            for (const k of Object.keys(map)) {
+                const mm = map[k].url && map[k].url.match(/https?:\/\/([^:/]+)/i);
+                if (mm && hosts.indexOf(mm[1]) < 0) hosts.push(mm[1]);
+            }
+        } catch (e) { }
+        return hosts;
+    }
+    function fetchWinEvents(logName, max, computer) {
+        return new Promise(resolve => {
+            const remote = computer && computer.trim() && computer.trim().toLowerCase() !== 'localhost';
+            const comp = remote ? ` -ComputerName '${computer.trim().replace(/'/g, "''")}'` : '';
+            const ps = `try { Get-WinEvent -LogName '${logName.replace(/'/g, "''")}' -MaxEvents ${max}${comp} -ErrorAction Stop | ` +
+                `Select-Object @{n='time';e={$_.TimeCreated.ToString('o')}}, @{n='level';e={$_.LevelDisplayName}}, ` +
+                `@{n='id';e={$_.Id}}, @{n='source';e={$_.ProviderName}}, @{n='message';e={$_.Message}} | ` +
+                `ConvertTo-Json -Depth 2 -Compress } catch { Write-Error $_.Exception.Message }`;
+            cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+                { maxBuffer: 40 * 1024 * 1024, windowsHide: true },
+                (err, stdout, stderr) => {
+                    if (err) { resolve({ error: (stderr || err.message || '').trim(), events: [] }); return; }
+                    let data = [];
+                    try { const j = JSON.parse(stdout || '[]'); data = Array.isArray(j) ? j : [j]; } catch (e) { }
+                    resolve({ events: data });
+                });
+        });
+    }
+    context.subscriptions.push(vscode.commands.registerCommand('extension.openEventViewer', () => {
+        if (eventViewerPanel) { eventViewerPanel.reveal(vscode.ViewColumn.Active, false); return; }
+        eventViewerPanel = vscode.window.createWebviewPanel(
+            'modscriptEventViewer', 'Windows Event Viewer', vscode.ViewColumn.Active,
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+        eventViewerPanel.webview.html = getEventViewerHtml();
+        eventViewerPanel.webview.onDidReceiveMessage(async msg => {
+            if (msg.cmd === 'ready') {
+                eventViewerPanel.webview.postMessage({ cmd: 'config', computer: getRepoServerHost(), hosts: getAllRepoHosts() });
+            } else if (msg.cmd === 'fetch') {
+                const log = msg.log || 'Application';
+                const max = Math.min(msg.max || 300, 1000);
+                const computer = (msg.computer || '').trim();
+                let res = await fetchWinEvents(log, max, computer);
+                // If the remote server can't be reached, fall back to the local machine automatically
+                let note = null;
+                if (res.error && computer && computer.toLowerCase() !== 'localhost') {
+                    const local = await fetchWinEvents(log, max, 'localhost');
+                    if (!local.error) {
+                        note = `Could not reach '${computer}' (${res.error}). Showing this machine (localhost) instead.`;
+                        res = local;
+                        res.computer = 'localhost';
+                    }
+                }
+                eventViewerPanel.webview.postMessage({ cmd: 'data', events: res.events, error: res.error || null, note, computer: res.computer || null });
+            }
+        }, undefined, context.subscriptions);
+        eventViewerPanel.onDidDispose(() => { eventViewerPanel = null; }, null, context.subscriptions);
+    }));
+
+    // ─── Search everywhere across scripts (full-text, with usage preview) ──────
+    // Returns matches with surrounding context so the webview can show a JetBrains-style preview.
+    function searchScripts(query) {
+        const q = (query || '').toLowerCase().trim();
+        let contents = [];
+        try { contents = ComposerController_1.getScriptContents(); } catch (e) { }
+        const out = [];
+        const MAX_TOTAL = 400, MAX_PER_FILE = 25, CTX = 12;
+        if (!q) {
+            // no query → list every script (name only) so the window is useful immediately
+            for (const s of contents) {
+                out.push({ id: s.id, name: s.name, solution: s.solution, type: s.type, line: 0, lineText: '', context: [], nameOnly: true });
+                if (out.length >= MAX_TOTAL) break;
+            }
+            out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+            return out;
+        }
+        for (const s of contents) {
+            if (out.length >= MAX_TOTAL) break;
+            const lines = String(s.text || '').split(/\r?\n/);
+            let perFile = 0;
+            const nameMatch = String(s.name || '').toLowerCase().indexOf(q) >= 0;
+            if (nameMatch) { out.push({ id: s.id, name: s.name, solution: s.solution, type: s.type, line: 0, lineText: s.name, context: lines.slice(0, CTX + 1).map((t, i) => ({ n: i, text: t })), nameMatch: true }); perFile++; }
+            for (let i = 0; i < lines.length; i++) {
+                if (perFile >= MAX_PER_FILE || out.length >= MAX_TOTAL) break;
+                if (lines[i].toLowerCase().indexOf(q) < 0) continue;
+                const from = Math.max(0, i - CTX), to = Math.min(lines.length - 1, i + CTX);
+                const context = [];
+                for (let j = from; j <= to; j++) context.push({ n: j, text: lines[j], hit: j === i });
+                out.push({ id: s.id, name: s.name, solution: s.solution, type: s.type, line: i, lineText: lines[i].trim(), context });
+                perFile++;
+            }
+        }
+        return out;
+    }
+    async function openScriptAtLine(id, line) {
+        try {
+            await vscode.commands.executeCommand('composerExplorer.openFile', id);
+            for (let i = 0; i < 30; i++) {
+                await new Promise(r => setTimeout(r, 50));
+                const ed = vscode.window.activeTextEditor;
+                if (ed && ed.document && ed.document.uri.scheme === ComposerController_1.MEM_FS_SCHEMA) {
+                    const pos = new vscode.Position(Math.max(0, line || 0), 0);
+                    ed.selection = new vscode.Selection(pos, pos);
+                    ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+                    return;
+                }
+            }
+        } catch (e) { vscode.window.showErrorMessage('Could not open script: ' + e.message); }
+    }
+    context.subscriptions.push(vscode.commands.registerCommand('extension.searchAllScripts', () => {
+        if (scriptSearchPanel) { scriptSearchPanel.reveal(vscode.ViewColumn.Active, false); return; }
+        scriptSearchPanel = vscode.window.createWebviewPanel(
+            'modscriptScriptSearch', 'Search Everywhere', vscode.ViewColumn.Active,
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+        scriptSearchPanel.webview.html = getScriptSearchHtml();
+        scriptSearchPanel.webview.onDidReceiveMessage(async msg => {
+            if (msg.cmd === 'ready' || msg.cmd === 'search') {
+                scriptSearchPanel.webview.postMessage({ cmd: 'results', q: msg.q || '', matches: searchScripts(msg.q || '') });
+            } else if (msg.cmd === 'open' && msg.id) {
+                await openScriptAtLine(msg.id, msg.line || 0);  // window stays open (webview tab is retained)
+            }
+        }, undefined, context.subscriptions);
+        scriptSearchPanel.onDidDispose(() => { scriptSearchPanel = null; }, null, context.subscriptions);
+    }));
+
     // Show the welcome page automatically on first install/activation
     if (!context.globalState.get('modscript.welcomeShown')) {
         context.globalState.update('modscript.welcomeShown', true);
@@ -288,6 +550,8 @@ function activate(context) {
 
     const kbProvider = new KnowledgeBaseProvider(context);
     context.subscriptions.push(vscode.window.createTreeView('modscriptKnowledgeBase', { treeDataProvider: kbProvider }));
+
+    context.subscriptions.push(vscode.window.createTreeView('modscriptTools', { treeDataProvider: new ToolsProvider() }));
 
     // Helper: derive a favourite payload from a clicked tree item (works for both the
     // main Composer Explorer items and the Checked-out view items)
@@ -384,6 +648,7 @@ function activate(context) {
     //Gives autocomplete on classes, free functions, variables, and custom functions.
     const provider1 = vscode.languages.registerCompletionItemProvider("modscript", {
         provideCompletionItems(document, position, token, context) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableCompletion', true)) return;
             var _a;
             let compitems = [];
             for (var item of languageKeywords) {
@@ -565,6 +830,7 @@ function activate(context) {
     // Gives autocomplete on function that are meathods of a class or variable of a class.
     const provider2 = vscode.languages.registerCompletionItemProvider('modscript', {
         provideCompletionItems(document, position) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableCompletion', true)) return;
             const linePrefix = " " + document.lineAt(position).text.substr(0, position.character);
             let compitems = [];
             for (const [clsName, cls] of Object.entries(classes)) {
@@ -716,6 +982,7 @@ function activate(context) {
     //Gives function signiture completion on function paramaters and gives info about the function. 
     const providor3 = vscode.languages.registerSignatureHelpProvider("modscript", {
         provideSignatureHelp(document, position, token, context) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableSignatureHelp', true)) return;
             const SignatureHelp = new vscode.SignatureHelp();
             let activeSignatureHelp = context.activeSignatureHelp;
             let activeSignatureIndex = activeSignatureHelp ? activeSignatureHelp.activeSignature : 0;
@@ -870,6 +1137,7 @@ function activate(context) {
     // });
     const providor4 = vscode.languages.registerHoverProvider('modscript', {
         provideHover(document, position, token) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableHover', true)) return;
             try {
                 let wordRange = document.getWordRangeAtPosition(position);
                 let wordLookup = document.getText(wordRange);
@@ -992,6 +1260,7 @@ function activate(context) {
     //Snippet completion for /** Function Documentation comments
     const provider6 = vscode.languages.registerCompletionItemProvider("modscript", {
         provideCompletionItems(document, position, token, context) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableCompletion', true)) return;
             let linePrefix = document.lineAt(position).text.substr(0, position.character);
             if (!linePrefix.match(/^\s*\/\*\*/g)) {
                 return;
@@ -1321,6 +1590,7 @@ function activate(context) {
     // (sorted by how often they're used), ahead of system API entries.
     const providerRepoSymbols = vscode.languages.registerCompletionItemProvider('modscript', {
         provideCompletionItems(document, position) {
+            if (!vscode.workspace.getConfiguration('modscript').get('enableCompletion', true)) return;
             let idx;
             try { idx = ComposerController_1.getScriptIndex(); } catch (e) { return; }
             if (!idx || !idx.symbols || !idx.symbols.length) return;
@@ -1519,19 +1789,26 @@ function activate(context) {
     // vscode.window.registerTreeDataProvider('composerExplorer', treeDataProvider);
     //}
     //Run this once on when vscode opens to initilaize the Variables array on the open file;
+    // Parse, then always run diagnostics — even if parsing threw — so errors show in the editor.
+    async function parseAndDiagnose(document) {
+        if (!document) return;
+        try { await ParseDocument(document); }
+        catch (e) { console.error('[ParseDocument] failed for', document.uri && document.uri.toString(), e); }
+        try { runDiagnostics(document); } catch (e) { console.error('[runDiagnostics] outer', e); }
+    }
     setTimeout(() => {
         if (vscode.window.activeTextEditor) {
-            ParseDocument(vscode.window.activeTextEditor.document);
+            parseAndDiagnose(vscode.window.activeTextEditor.document);
         }
     }, 100);
     vscode.window.onDidChangeActiveTextEditor(debounce(TextEditor => {
         if (TextEditor && TextEditor.document) {
-            ParseDocument(TextEditor.document);
+            parseAndDiagnose(TextEditor.document);
         }
     }, 300, false));
     vscode.workspace.onDidChangeTextDocument(debounce(changeEvent => {
         if (changeEvent && changeEvent.document) {
-            ParseDocument(changeEvent.document);
+            parseAndDiagnose(changeEvent.document);
         }
     }, 300, false));
     //This is where we will watch the document and when it finds variables put them into an array of typed vars
@@ -2122,97 +2399,8 @@ function activate(context) {
         globalFuncs[document.uri.toString()] = newMeathods;
         globalClasses[document.uri.toString()] = newClasses;
 
-        // ── Diagnostics: flag identifiers that aren't defined anywhere (real typos) ──
-        // "Known" = language keywords + SBM API + symbols parsed here + every identifier that
-        // appears anywhere in the repository (auto-covers lib.core symbols like VarType_Integer,
-        // ReadFlags, LCase that aren't in our compiled API) + local declarations in this buffer.
-        if (diagnosticCollection && vscode.workspace.getConfiguration('modscript').get('checkUndefinedVariables', true)) {
-            try {
-                const known = new Set();
-                const addName = n => { if (n) known.add(String(n).toLowerCase()); };
-                languageKeywords.forEach(addName);
-                ['true', 'false', 'null', 'this', 'fun', 'attr', 'global', 'in', 'is', 'new', 'void', 'me',
-                 'class', 'include', 'do', 'then', 'and', 'or', 'not', 'each', 'as'].forEach(addName);
-                // Type keywords (used in typed params / declarations: def f(bool x), var x is int, ...)
-                ['bool', 'int', 'integer', 'string', 'double', 'float', 'long', 'date', 'datetime', 'time',
-                 'variant', 'object', 'char', 'byte', 'short', 'decimal', 'number'].forEach(addName);
-                for (const v of varList) addName(v.variable);
-                for (const f of newMeathods) addName(f.meathodName);
-                for (const c of newClasses) { addName(c.className); for (const m of (c.meathods || [])) addName(m.meathodName); for (const p of (c.properties || [])) addName(p.propertyName); }
-                for (const [, cls] of Object.entries(classes)) {
-                    if (cls.className) addName(cls.className);
-                    for (const m of (cls.meathods || [])) addName(m.meathodName);
-                    for (const p of (cls.properties || [])) addName(p.propertyName);
-                }
-                // Repo-wide identifiers + globals (covers lib.core, VarType_*, RegexOptionBitsConstants, etc.)
-                try {
-                    const idx = ComposerController_1.getScriptIndex();
-                    if (idx && idx.usage) for (const k of Object.keys(idx.usage)) known.add(k);
-                    if (idx && idx.globals) for (const k of Object.keys(idx.globals)) known.add(k);
-                } catch (e) { }
-
-                // Build a comment-free, string-free mask of each line (handles /* */ across lines)
-                const masked = [];
-                let inBlock = false;
-                for (let li = 0; li < document.lineCount; li++) {
-                    const raw = document.lineAt(li).text;
-                    let out = '', j = 0;
-                    while (j < raw.length) {
-                        if (inBlock) {
-                            if (raw[j] === '*' && raw[j + 1] === '/') { inBlock = false; out += '  '; j += 2; }
-                            else { out += ' '; j++; }
-                        } else if (raw[j] === '/' && raw[j + 1] === '*') { inBlock = true; out += '  '; j += 2; }
-                        else if (raw[j] === '/' && raw[j + 1] === '/') { out += ' '.repeat(raw.length - j); break; }
-                        else { out += raw[j]; j++; }
-                    }
-                    out = out.replace(/"[^"]*"/g, m => ' '.repeat(m.length)).replace(/'[^']*'/g, m => ' '.repeat(m.length));
-                    masked.push(out);
-                }
-                // Collect local declarations from the buffer (handles := , for-items, catch params, typed params)
-                const fullMasked = masked.join('\n');
-                let dm;
-                const declRe = /\b(?:var|global|attr)\s+([A-Za-z_]\w*)/g;            // var x / global x / attr x
-                while ((dm = declRe.exec(fullMasked))) addName(dm[1]);
-                const assignRe = /([A-Za-z_]\w*)\s*:?=(?!=)/g;                        // x = ...  and  x := ...
-                while ((dm = assignRe.exec(fullMasked))) addName(dm[1]);
-                const forRe = /\bfor\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*:/g; // for (item : ...) / for (Type item : ...)
-                while ((dm = forRe.exec(fullMasked))) addName(dm[1]);
-                const catchRe = /\bcatch\s*\(\s*(?:[A-Za-z_]\w*\s+)?([A-Za-z_]\w*)\s*\)/g; // catch(e) / catch(Type e)
-                while ((dm = catchRe.exec(fullMasked))) addName(dm[1]);
-                const paramRe = /\bdef\s+(?:[A-Za-z_]\w*::)?[A-Za-z_]\w*\s*\(([^)]*)\)/g; // def f(a, int b) params
-                while ((dm = paramRe.exec(fullMasked))) {
-                    for (let part of dm[1].split(',')) {
-                        const toks = part.trim().split(/\s+/);
-                        if (toks.length) addName(toks[toks.length - 1]);
-                    }
-                }
-
-                const diags = [];
-                const reIdent = /[A-Za-z_]\w*/g;
-                for (let li = 0; li < masked.length; li++) {
-                    const text = masked[li];
-                    if (/^\s*include\s*\(/.test(text)) continue;               // skip include() lines
-                    let m;
-                    while ((m = reIdent.exec(text))) {
-                        const word = m[0], start = m.index;
-                        if (/^\d/.test(word)) continue;
-                        const before = text.slice(0, start);
-                        const after = text.slice(start + word.length);
-                        if (/[.]\s*$/.test(before)) continue;                  // member access  x.word
-                        if (/^\s*\(/.test(after)) continue;                    // function call   word(
-                        if (/^\s*::/.test(after) || /::\s*$/.test(before)) continue; // Class::method
-                        if (/^\s*:?=(?!=)/.test(after)) continue;              // assignment target  word = / word :=
-                        if (/(?:\bdef|\bvar|\bglobal|\battr|\bclass|\bcase|\bcatch|\bfor)\s*[\(\s]$/.test(before)) continue; // declaration target
-                        if (known.has(word.toLowerCase())) continue;
-                        const range = new vscode.Range(li, start, li, start + word.length);
-                        diags.push(new vscode.Diagnostic(range, `'${word}' is not defined in this script or its includes.`, vscode.DiagnosticSeverity.Error));
-                    }
-                }
-                diagnosticCollection.set(document.uri, diags);
-            } catch (e) { console.error('[diagnostics]', e); }
-        } else if (diagnosticCollection) {
-            diagnosticCollection.set(document.uri, []);
-        }
+        // Diagnostics run independently (see runDiagnostics) so a parse error never hides errors
+        runDiagnostics(document);
 
         // Refresh the outline panel with newly parsed symbols
         if (outlineProvider) outlineProvider.refresh();
@@ -2684,6 +2872,9 @@ button.primary:hover { background: var(--vscode-button-hoverBackground); }
 .actions { display: flex; gap: 9px; margin-top: 6px; align-items: center; }
 .saved { color: var(--vscode-charts-green, #4caf50); font-size: 12px; opacity: 0; transition: opacity .2s; }
 .saved.show { opacity: 1; }
+.tg { display: block; padding: 6px 0; font-size: 13px; cursor: pointer; }
+.tg input { vertical-align: middle; margin-right: 6px; accent-color: var(--vscode-button-background); }
+.tg .td { display: block; margin-left: 22px; opacity: .6; font-size: 11.5px; }
 .link { color: var(--vscode-textLink-foreground); cursor: pointer; font-size: 12.5px; }
 .link:hover { text-decoration: underline; }
 code { font-family: monospace; background: var(--vscode-textCodeBlock-background, #252526); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
@@ -2705,6 +2896,16 @@ code { font-family: monospace; background: var(--vscode-textCodeBlock-background
     <input type="text" id="export" placeholder="Default (Documents/SBM Composer/Imports)">
     <button id="browse">Browse…</button>
   </div>
+</div>
+
+<div class="card">
+  <h2>Features</h2>
+  <div class="hint">Turn editor features on or off.</div>
+  <label class="tg"><input type="checkbox" id="t_enableCompletion"> <b>Code completion (IntelliSense)</b><span class="td">Suggest keywords, snippets, classes, functions and project symbols as you type.</span></label>
+  <label class="tg"><input type="checkbox" id="t_enableDiagnostics"> <b>Error checking</b><span class="td">Underline problems and list them under "Composer problems".</span></label>
+  <label class="tg"><input type="checkbox" id="t_checkUndefinedVariables"> <b>Undefined variable warnings</b><span class="td">Flag identifiers not defined in the script, includes or repository.</span></label>
+  <label class="tg"><input type="checkbox" id="t_enableHover"> <b>Hover tooltips</b><span class="td">Show a symbol's type/description on hover.</span></label>
+  <label class="tg"><input type="checkbox" id="t_enableSignatureHelp"> <b>Parameter hints</b><span class="td">Show function parameters while typing a call.</span></label>
 </div>
 
 <div class="card">
@@ -2755,8 +2956,11 @@ function renderRepos() {
 document.getElementById('browse').addEventListener('click', function(){ vsc.postMessage({cmd:'browseExport'}); });
 document.getElementById('keys').addEventListener('click', function(){ vsc.postMessage({cmd:'openKeybindings'}); });
 document.getElementById('json').addEventListener('click', function(){ vsc.postMessage({cmd:'openSettingsJson'}); });
+var TOGGLE_KEYS = ['enableCompletion','enableDiagnostics','checkUndefinedVariables','enableHover','enableSignatureHelp'];
 document.getElementById('save').addEventListener('click', function(){
-  vsc.postMessage({ cmd:'save', repositoryFolder: current.repositoryFolder, exportFolder: document.getElementById('export').value.trim() });
+  var toggles = {};
+  TOGGLE_KEYS.forEach(function(k){ var el=document.getElementById('t_'+k); if(el) toggles[k]=el.checked; });
+  vsc.postMessage({ cmd:'save', repositoryFolder: current.repositoryFolder, exportFolder: document.getElementById('export').value.trim(), toggles: toggles });
 });
 
 window.addEventListener('message', function(e) {
@@ -2767,6 +2971,7 @@ window.addEventListener('message', function(e) {
     current.repos = m.repos || [];
     document.getElementById('root').textContent = m.root || '(not found)';
     document.getElementById('export').value = m.exportFolder || '';
+    if (m.toggles) TOGGLE_KEYS.forEach(function(k){ var el=document.getElementById('t_'+k); if(el) el.checked = m.toggles[k] !== false; });
     renderRepos();
   } else if (m.cmd === 'exportPicked') {
     document.getElementById('export').value = m.path;
@@ -2901,6 +3106,11 @@ code { font-family: monospace; background: var(--vscode-textCodeBlock-background
   <tr><td>Checked Out view</td><td>Lists checked-out scripts; checking one out opens it automatically</td></tr>
   <tr><td>Favourites</td><td>Right-click a script → <b>Add to Favourites</b> (☆ inline button)</td></tr>
   <tr><td>Code Snippets</td><td>Named snippets — + to add, click to insert, or select code → right-click → Save to Code Snippets</td></tr>
+  <tr><td>Windows Event Viewer</td><td><b>Modscript: Open Windows Event Viewer</b> — filter/refresh Windows logs in VS Code</td></tr>
+  <tr><td>Search all scripts</td><td><b>Modscript: Search All Scripts</b> — persistent, clickable list of every script by name</td></tr>
+  <tr><td>Configuration &amp; Tools</td><td>A view under Code Snippets listing all panels &amp; settings — click to open</td></tr>
+  <tr><td>Feature toggles</td><td>Settings panel (or settings.json): turn completion, diagnostics, hover and signature help on/off</td></tr>
+  <tr><td>Czech language</td><td>UI follows the VS Code display language (cs supported)</td></tr>
   <tr><td>Welcome page</td><td><b>Modscript: Open Welcome</b></td></tr>
 </table>
 
@@ -2919,6 +3129,224 @@ document.querySelectorAll('button[data-cmd]').forEach(function(b) {
         '</head>\n<body>\n' + html + '\n' +
         '<script>' + js + '</script>\n' +
         '</body>\n</html>';
+}
+
+function getEventViewerHtml() {
+    const css = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.toolbar { padding: 8px; border-bottom: 1px solid var(--vscode-panel-border); flex-shrink: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+select, input { padding: 4px 8px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); border-radius: 3px; font-size: 12px; outline: none; }
+#filter { flex: 1; min-width: 120px; }
+button { padding: 4px 12px; border: none; border-radius: 3px; font-size: 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+button:hover { background: var(--vscode-button-hoverBackground); }
+button.sec { background: var(--vscode-button-secondaryBackground, #3a3d41); color: var(--vscode-button-secondaryForeground, #fff); }
+.wrap { flex: 1; overflow: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { position: sticky; top: 0; background: var(--vscode-editor-background); text-align: left; padding: 5px 8px; border-bottom: 2px solid var(--vscode-panel-border); font-size: 10px; text-transform: uppercase; opacity: .7; }
+td { padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+tr:hover td { background: var(--vscode-list-hoverBackground); }
+.msg { white-space: pre-wrap; word-break: break-word; max-width: 600px; }
+.lvl { font-weight: 600; }
+.lvl.Error { color: var(--vscode-errorForeground, #f48771); }
+.lvl.Warning { color: var(--vscode-editorWarning-foreground, #cca700); }
+.time { white-space: nowrap; opacity: .8; }
+.src { white-space: nowrap; }
+.empty { padding: 20px; opacity: .6; text-align: center; }
+.count { opacity: .6; font-size: 11px; }
+`;
+    const html = `
+<div class="toolbar">
+  <label>Log
+    <select id="log">
+      <option>Application</option>
+      <option>System</option>
+      <option>Security</option>
+      <option>Setup</option>
+      <option>Windows PowerShell</option>
+    </select>
+  </label>
+  <label>Level
+    <select id="level">
+      <option value="">All</option>
+      <option>Error</option>
+      <option>Warning</option>
+      <option>Information</option>
+    </select>
+  </label>
+  <label>Computer <input id="computer" type="text" placeholder="localhost" list="hosts" style="width:170px"><datalist id="hosts"></datalist></label>
+  <input id="filter" type="text" placeholder="Filter by source or message...">
+  <button id="refresh">Refresh</button>
+  <button class="sec" id="clear">Clear view</button>
+  <span class="count" id="count"></span>
+</div>
+<div id="note" style="display:none;padding:6px 10px;background:var(--vscode-inputValidation-warningBackground,#5a4a1a);border-bottom:1px solid var(--vscode-panel-border);font-size:11.5px"></div>
+<div class="wrap" id="wrap"><p class="empty">Loading…</p></div>`;
+    const js = `
+(function() {
+var vsc = acquireVsCodeApi();
+var ALL = [];
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function render() {
+  var lvl = document.getElementById('level').value;
+  var q = document.getElementById('filter').value.toLowerCase();
+  var rows = ALL.filter(function(e){
+    if (lvl && e.level !== lvl) return false;
+    if (q && (String(e.source||'')+' '+String(e.message||'')).toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  });
+  document.getElementById('count').textContent = rows.length + ' / ' + ALL.length + ' events';
+  var w = document.getElementById('wrap');
+  if (!rows.length) { w.innerHTML = '<p class="empty">No matching events.</p>'; return; }
+  var h = '<table><thead><tr><th>Time</th><th>Level</th><th>Id</th><th>Source</th><th>Message</th></tr></thead><tbody>';
+  for (var i=0;i<rows.length;i++){ var e=rows[i];
+    h += '<tr><td class="time">'+esc((e.time||'').replace('T',' ').replace(/\\..*$/,''))+'</td>'+
+         '<td class="lvl '+esc(e.level)+'">'+esc(e.level)+'</td>'+
+         '<td>'+esc(e.id)+'</td>'+
+         '<td class="src">'+esc(e.source)+'</td>'+
+         '<td class="msg">'+esc(e.message)+'</td></tr>';
+  }
+  w.innerHTML = h + '</tbody></table>';
+}
+function fetchNow(){ var n=document.getElementById('note'); n.style.display='none'; document.getElementById('wrap').innerHTML='<p class="empty">Loading…</p>'; vsc.postMessage({cmd:'fetch', log:document.getElementById('log').value, computer:document.getElementById('computer').value.trim(), max:300}); }
+document.getElementById('refresh').addEventListener('click', fetchNow);
+document.getElementById('log').addEventListener('change', fetchNow);
+document.getElementById('computer').addEventListener('keydown', function(e){ if(e.key==='Enter') fetchNow(); });
+document.getElementById('level').addEventListener('change', render);
+document.getElementById('filter').addEventListener('input', render);
+document.getElementById('clear').addEventListener('click', function(){ ALL=[]; render(); document.getElementById('wrap').innerHTML='<p class="empty">View cleared. Click Refresh to reload.</p>'; });
+window.addEventListener('message', function(ev){ var m=ev.data;
+  if(m.cmd==='config'){ if(m.computer) document.getElementById('computer').value=m.computer;
+    var dl=document.getElementById('hosts'); dl.innerHTML='<option value="localhost">'+(m.hosts||[]).map(function(h){return '<option value="'+esc(h)+'">';}).join('');
+    fetchNow(); }
+  else if(m.cmd==='data'){
+    if(m.computer) document.getElementById('computer').value=m.computer;
+    if(m.error){ document.getElementById('wrap').innerHTML='<p class="empty">Error: '+esc(m.error)+'<br><br>Try setting Computer to <b>localhost</b>.</p>'; document.getElementById('count').textContent=''; return;}
+    ALL=m.events||[]; render();
+    if(m.note){ var n=document.getElementById('note'); n.textContent=m.note; n.style.display='block'; }
+  }
+});
+vsc.postMessage({cmd:'ready'});
+})();
+`;
+    return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n' +
+        '<title>Windows Event Viewer</title>\n<style>' + css + '</style>\n</head>\n<body>\n' +
+        html + '\n<script>' + js + '</script>\n</body>\n</html>';
+}
+
+function getScriptSearchHtml() {
+    const css = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.bar { padding: 10px; border-bottom: 1px solid var(--vscode-panel-border); display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+#q { flex: 1; padding: 8px 12px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, #555); border-radius: 4px; font-size: 15px; outline: none; }
+#q:focus { border-color: var(--vscode-focusBorder); }
+.count { opacity: .6; font-size: 11px; white-space: nowrap; }
+.split { display: flex; flex: 1; overflow: hidden; }
+.list { width: 42%; min-width: 220px; overflow: auto; border-right: 1px solid var(--vscode-panel-border); }
+.row { padding: 5px 12px; cursor: pointer; border-bottom: 1px solid var(--vscode-panel-border); }
+.row:hover { background: var(--vscode-list-hoverBackground); }
+.row.sel { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+.r1 { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.ic { font-size: 10px; width: 26px; flex-shrink: 0; opacity: .8; }
+.nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.ln { opacity: .5; font-size: 11px; white-space: nowrap; }
+.r2 { font-family: monospace; font-size: 11px; opacity: .7; margin-left: 26px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r2 b { color: var(--vscode-editor-findMatchHighlightForeground, inherit); background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,220,0,.35)); }
+.preview { flex: 1; overflow: auto; padding: 12px 14px; }
+.pv-h { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.pv-sub { opacity: .6; font-size: 11px; margin-bottom: 12px; }
+.code { font-family: monospace; font-size: 12px; white-space: pre; }
+.cl { display: flex; }
+.cl .gut { width: 44px; text-align: right; padding-right: 10px; opacity: .4; flex-shrink: 0; user-select: none; }
+.cl .txt { white-space: pre; }
+.cl.hit { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,220,0,.18)); }
+.cl.hit .txt b { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,220,0,.45)); }
+.c-cmt { color: #6A9955; font-style: italic; }
+.c-str { color: #ce9178; }
+.c-num { color: #b5cea8; }
+.c-kw { color: #569cd6; }
+.c-typ { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+.c-fn { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+.empty { padding: 24px; opacity: .55; text-align: center; }
+.openbtn { margin-top: 14px; padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: 12px; }
+`;
+    const html = `
+<div class="bar">
+  <input id="q" type="text" placeholder="Search everywhere in scripts…" autofocus>
+  <span class="count" id="count"></span>
+</div>
+<div class="split">
+  <div class="list" id="list"><p class="empty">Type to search…</p></div>
+  <div class="preview" id="preview"><p class="empty">Select a result to preview.</p></div>
+</div>`;
+    const js = `
+(function(){
+var vsc = acquireVsCodeApi();
+var M = [], SEL = 0, lastQ = '';
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function hl(s, q){ s = esc(s); if(!q) return s; var i = s.toLowerCase().indexOf(q.toLowerCase()); if(i<0) return s; return s.slice(0,i)+'<b>'+s.slice(i,i+q.length)+'</b>'+s.slice(i+q.length); }
+var KW={def:1,'var':1,global:1,attr:1,'class':1,'if':1,'else':1,'for':1,'while':1,'switch':1,'case':1,'default':1,'return':1,'break':1,'continue':1,'try':1,'catch':1,'finally':1,'this':1,include:1,fun:1,'new':1,'true':1,'false':1,'null':1,'in':1,is:1,'and':1,'or':1,'not':1};
+var TYP={bool:1,int:1,integer:1,string:1,'double':1,'float':1,'long':1,date:1,datetime:1,variant:1,object:1,'void':1,'char':1,'byte':1,'short':1,decimal:1,number:1};
+function synHL(s){ s=String(s||''); var out='',i=0,n=s.length;
+  while(i<n){ var ch=s[i];
+    if(ch==='/'&&s[i+1]==='/'){ out+='<span class="c-cmt">'+esc(s.slice(i))+'</span>'; break; }
+    if(ch==='/'&&s[i+1]==='*'){ var e=s.indexOf('*/',i+2); var end=e<0?n:e+2; out+='<span class="c-cmt">'+esc(s.slice(i,end))+'</span>'; i=end; continue; }
+    if(ch==='"'||ch==="'"){ var q=ch,j=i+1; while(j<n&&s[j]!==q){ if(s[j]==='\\\\')j++; j++; } j=j<n?j+1:n; out+='<span class="c-str">'+esc(s.slice(i,j))+'</span>'; i=j; continue; }
+    if(ch>='0'&&ch<='9'){ var j2=i; while(j2<n&&((s[j2]>='0'&&s[j2]<='9')||s[j2]==='.'))j2++; out+='<span class="c-num">'+esc(s.slice(i,j2))+'</span>'; i=j2; continue; }
+    if(/[A-Za-z_]/.test(ch)){ var j3=i; while(j3<n&&/[A-Za-z0-9_]/.test(s[j3]))j3++; var w=s.slice(i,j3); var cl=KW[w]?'c-kw':(TYP[w]?'c-typ':(s[j3]==='('?'c-fn':null)); out+=cl?'<span class="'+cl+'">'+esc(w)+'</span>':esc(w); i=j3; continue; }
+    out+=esc(ch); i++;
+  }
+  return out;
+}
+function renderList(){
+  var L = document.getElementById('list');
+  document.getElementById('count').textContent = M.length ? (M.length + ' results') : '';
+  if (!M.length) { L.innerHTML = '<p class="empty">No matches.</p>'; document.getElementById('preview').innerHTML='<p class="empty">No matches.</p>'; return; }
+  if (SEL >= M.length) SEL = M.length-1; if (SEL < 0) SEL = 0;
+  var h = '';
+  for (var i=0;i<M.length;i++){ var m=M[i];
+    h += '<div class="row'+(i===SEL?' sel':'')+'" data-idx="'+i+'">'+
+         '<div class="r1"><span class="ic">'+(m.type==='javascript'?'JS':'MS')+'</span><span class="nm">'+esc(m.name)+'</span>'+
+         (m.nameOnly?'':'<span class="ln">:'+(m.line+1)+'</span>')+'</div>'+
+         (m.lineText?'<div class="r2">'+hl(m.lineText, lastQ)+'</div>':'')+'</div>';
+  }
+  L.innerHTML = h;
+  var se = L.querySelector('.row.sel'); if (se) se.scrollIntoView({block:'nearest'});
+  renderPreview();
+}
+function renderPreview(){
+  var m = M[SEL], P = document.getElementById('preview');
+  if (!m){ P.innerHTML='<p class="empty">Select a result.</p>'; return; }
+  var h = '<div class="pv-h">'+esc(m.name)+'</div><div class="pv-sub">'+esc(m.solution)+' · '+(m.type==='javascript'?'Javascript':'Modscript')+(m.nameOnly?'':' · line '+(m.line+1))+'</div>';
+  if (m.context && m.context.length){
+    h += '<div class="code">';
+    for (var j=0;j<m.context.length;j++){ var c=m.context[j];
+      h += '<div class="cl'+(c.hit?' hit':'')+'"><span class="gut">'+(c.n+1)+'</span><span class="txt">'+synHL(c.text)+'</span></div>';
+    }
+    h += '</div>';
+  }
+  h += '<div><button class="openbtn" id="openbtn">Open script ↗</button></div>';
+  P.innerHTML = h;
+  var b=document.getElementById('openbtn'); if(b) b.addEventListener('click', function(){ openIdx(SEL); });
+}
+function openIdx(i){ var m=M[i]; if(m) vsc.postMessage({cmd:'open', id:m.id, line:m.line||0}); }
+var t;
+document.getElementById('q').addEventListener('input', function(){ clearTimeout(t); t=setTimeout(function(){ vsc.postMessage({cmd:'search', q:document.getElementById('q').value}); }, 150); });
+document.getElementById('q').addEventListener('keydown', function(e){
+  if(e.key==='ArrowDown'){ SEL++; renderList(); e.preventDefault(); }
+  else if(e.key==='ArrowUp'){ SEL--; renderList(); e.preventDefault(); }
+  else if(e.key==='Enter'){ openIdx(SEL); }
+});
+document.getElementById('list').addEventListener('click', function(e){ var r=e.target.closest('.row'); if(r){ SEL=parseInt(r.dataset.idx,10); renderList(); } });
+document.getElementById('list').addEventListener('dblclick', function(e){ var r=e.target.closest('.row'); if(r){ SEL=parseInt(r.dataset.idx,10); openIdx(SEL); } });
+window.addEventListener('message', function(ev){ var d=ev.data; if(d.cmd==='results'){ lastQ=d.q||''; M=d.matches||[]; SEL=0; renderList(); document.getElementById('q').focus(); } });
+vsc.postMessage({cmd:'ready'});
+})();
+`;
+    return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n' +
+        '<title>Search Everywhere</title>\n<style>' + css + '</style>\n</head>\n<body>\n' +
+        html + '\n<script>' + js + '</script>\n</body>\n</html>';
 }
 
 // ─── Modscript Outline: tree item ───────────────────────────────────────────
@@ -3274,6 +3702,49 @@ class KnowledgeBaseProvider {
             item.command = { command: 'extension.kbInsert', title: 'Insert', arguments: [e] };
             return item;
         });
+    }
+}
+
+// ─── Configuration & Tools view (hub of panels/settings) ─────────────────────
+class ToolsProvider {
+    getTreeItem(e) { return e; }
+    getChildren(element) {
+        const mk = (label, desc, icon, command, args) => {
+            const it = new vscode.TreeItem(label);
+            it.description = desc;
+            it.iconPath = new vscode.ThemeIcon(icon);
+            it.command = { command, title: label, arguments: args || [] };
+            return it;
+        };
+        if (element && element.toolsGroup === 'panels') {
+            return [
+                mk('Composer Explorer', 'Repository scripts', 'list-tree', 'composerExplorer.focus'),
+                mk('Checked Out', 'Currently checked-out scripts', 'verified', 'modscriptCheckedOut.focus'),
+                mk('Favourites', 'Your starred scripts', 'star-full', 'modscriptFavourites.focus'),
+                mk('Code Snippets', 'Saved code blocks', 'symbol-snippet', 'modscriptKnowledgeBase.focus'),
+                mk('Modscript Outline', 'Symbols in the open script', 'symbol-class', 'modscriptOutline.focus')
+            ];
+        }
+        if (element && element.toolsGroup === 'tools') {
+            return [
+                mk('Settings', 'Repository, export folder, features', 'settings-gear', 'extension.openSettingsPanel'),
+                mk('Reference Browser', 'SBM API + your symbols', 'library', 'extension.openClassBrowser'),
+                mk('Search all scripts', 'Find any script by name', 'search', 'extension.searchAllScripts'),
+                mk('Windows Event Viewer', 'Windows logs inside VS Code', 'output', 'extension.openEventViewer'),
+                mk('Welcome / Guide', 'Features & shortcuts', 'book', 'extension.openWelcome'),
+                mk('Keyboard Shortcuts', 'View / rebind commands', 'keyboard', 'workbench.action.openGlobalKeybindings', ['Modscript']),
+                mk('Edit settings.json', 'Raw configuration file', 'json', 'workbench.action.openSettingsJson')
+            ];
+        }
+        if (element) return [];
+        // Root: two collapsible groups
+        const panels = new vscode.TreeItem('Panels', vscode.TreeItemCollapsibleState.Expanded);
+        panels.toolsGroup = 'panels';
+        panels.iconPath = new vscode.ThemeIcon('window');
+        const tools = new vscode.TreeItem('Tools & Settings', vscode.TreeItemCollapsibleState.Expanded);
+        tools.toolsGroup = 'tools';
+        tools.iconPath = new vscode.ThemeIcon('tools');
+        return [panels, tools];
     }
 }
 //# sourceMappingURL=extension.js.map
